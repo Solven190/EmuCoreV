@@ -40,7 +40,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          persist-credentials: false
 
       - name: Restore submodules
         timeout-minutes: 10
@@ -241,4 +240,4 @@ jobs:
           path: dist/*.apk
           compression-level: 0
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 14
