@@ -19,7 +19,7 @@ concurrency:
 
 defaults:
   run:
-    shell: bash
+    shell: bash --noprofile --norc -eo pipefail {0}
 
 env:
   NDK_VERSION: "29.0.14206865"
@@ -28,6 +28,8 @@ env:
   BUILD_TOOLS_VERSION: "37.0.0"
   VCPKG_BASELINE: "77df67cfff9c12ccfdb52284e07c87c75092f723"
   RUST_VERSION: "stable"
+  BUILD_TYPE: ${{ inputs.build_type }}
+  ECV_DIR: app/src/main/cpp/emucorev/ECV
 
 jobs:
   build:
@@ -38,28 +40,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Restore submodules
         timeout-minutes: 10
         run: |
-          set -euo pipefail
+          [ -f "$ECV_DIR/.gitmodules" ] || exit 0
 
-          ECV="app/src/main/cpp/emucorev/ECV"
-          if [ -f "$ECV/.gitmodules" ]; then
-            while read -r key path; do
-              name="${key#submodule.}"; name="${name%.path}"
-              url="$(git config -f "$ECV/.gitmodules" --get "submodule.${name}.url")"
-              target="$ECV/$path"
-              if [ -d "$target" ] && [ -n "$(ls -A "$target" 2>/dev/null)" ]; then continue; fi
-              sha="$(git ls-tree HEAD -- "$target" | awk '$1=="160000"{print $3}')"
-              [ -z "$sha" ] && { echo "::error::Pinned commit not found: $path"; exit 1; }
-              mkdir -p "$target"
-              git -C "$target" init -q
-              git -C "$target" remote add origin "$url"
-              git -C "$target" fetch -q --depth 1 origin "$sha"
-              git -C "$target" checkout -q FETCH_HEAD
-            done < <(git config -f "$ECV/.gitmodules" --get-regexp '^submodule\..*\.path$')
-          fi
+          while read -r key path; do
+            name="${key#submodule.}"; name="${name%.path}"
+            url="$(git config -f "$ECV_DIR/.gitmodules" --get "submodule.${name}.url")"
+            target="$ECV_DIR/$path"
+            if [ -d "$target" ] && [ -n "$(ls -A "$target" 2>/dev/null)" ]; then continue; fi
+            sha="$(git ls-tree HEAD -- "$target" | awk '$1=="160000"{print $3}')"
+            [ -n "$sha" ] || { echo "::error::Pinned commit not found: $path"; exit 1; }
+            mkdir -p "$target"
+            git -C "$target" init -q
+            git -C "$target" remote add origin "$url"
+            git -C "$target" fetch -q --depth 1 origin "$sha"
+            git -C "$target" checkout -q FETCH_HEAD
+          done < <(git config -f "$ECV_DIR/.gitmodules" --get-regexp '^submodule\..*\.path$')
 
       - name: Configure Google Services
         env:
@@ -86,29 +86,31 @@ jobs:
 
       - name: Decode release keystore
         if: inputs.build_type == 'release'
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
         run: |
-          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/signing"
-          echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/signing/release.keystore"
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/signing/release.keystore"
           chmod 600 "$RUNNER_TEMP/signing/release.keystore"
-          test -s "$RUNNER_TEMP/signing/release.keystore" \
+          [ -s "$RUNNER_TEMP/signing/release.keystore" ] \
             || { echo "::error::Keystore file is empty or invalid base64"; exit 1; }
 
       - name: Configure local.properties
         env:
-          BUILD_TYPE: ${{ inputs.build_type }}
+          STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
-          set -euo pipefail
+          umask 077
           {
-            echo "python3.path=$(command -v python3)"
+            printf 'python3.path=%s\n' "$(command -v python3)"
             if [ "$BUILD_TYPE" = "release" ]; then
-              echo "emucorev.release.storeFile=$RUNNER_TEMP/signing/release.keystore"
-              echo "emucorev.release.storePassword=${{ secrets.RELEASE_STORE_PASSWORD }}"
-              echo "emucorev.release.keyAlias=${{ secrets.RELEASE_KEY_ALIAS }}"
-              echo "emucorev.release.keyPassword=${{ secrets.RELEASE_KEY_PASSWORD }}"
+              printf 'emucorev.release.storeFile=%s\n' "$RUNNER_TEMP/signing/release.keystore"
+              printf 'emucorev.release.storePassword=%s\n' "$STORE_PASSWORD"
+              printf 'emucorev.release.keyAlias=%s\n' "$KEY_ALIAS"
+              printf 'emucorev.release.keyPassword=%s\n' "$KEY_PASSWORD"
             fi
           } > local.properties
-          chmod 600 local.properties
 
       - name: Install toolchain (SDK, NDK, Rust, CMake)
         timeout-minutes: 30
@@ -116,16 +118,19 @@ jobs:
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKMANAGER" --licenses >/dev/null || true
 
-          "$SDKMANAGER" "platforms;android-37.0" "build-tools;${BUILD_TOOLS_VERSION}" "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}"
+          "$SDKMANAGER" \
+            "platforms;android-${COMPILE_SDK}.0" \
+            "build-tools;${BUILD_TOOLS_VERSION}" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;${CMAKE_VERSION}"
 
-          ln -sfn "$ANDROID_HOME/platforms/android-37.0" "$ANDROID_HOME/platforms/android-37"
+          ln -sfn "$ANDROID_HOME/platforms/android-${COMPILE_SDK}.0" "$ANDROID_HOME/platforms/android-${COMPILE_SDK}"
 
-          rustup toolchain install "${RUST_VERSION}" --profile minimal
-          rustup target add --toolchain "${RUST_VERSION}" aarch64-linux-android
-          rustup default "${RUST_VERSION}"
-          rustup update "${RUST_VERSION}" --no-self-update
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target aarch64-linux-android
+          rustup default "$RUST_VERSION"
 
-          sudo apt-get update -qq && sudo apt-get install -y -qq ccache
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ccache
 
           {
             echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION"
@@ -134,18 +139,27 @@ jobs:
             echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
             echo "CCACHE_MAXSIZE=2G"
             echo "CCACHE_COMPRESS=1"
+            echo "CMAKE_C_COMPILER_LAUNCHER=ccache"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache"
           } >> "$GITHUB_ENV"
 
-      - name: Set up vcpkg & Resolve Rust hash
+      - name: Set up vcpkg and cache key
         id: setup
         timeout-minutes: 10
+        env:
+          VCPKG_MANIFEST_HASH: ${{ hashFiles('app/src/main/cpp/emucorev/ECV/vcpkg.json') }}
         run: |
           mkdir -p third_party
-          git clone https://github.com/microsoft/vcpkg.git third_party/vcpkg
-          git -C third_party/vcpkg checkout --detach "$VCPKG_BASELINE"
+          git clone -q https://github.com/microsoft/vcpkg.git third_party/vcpkg
+          git -C third_party/vcpkg checkout -q --detach "$VCPKG_BASELINE"
           ./third_party/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
-          echo "hash=$(rustc --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+          RUSTC_VERSION="$(rustc --version | awk '{print $2}')"
+          PREFIX="emucorev-${RUNNER_OS}-${BUILD_TYPE}-${NDK_VERSION}-${RUSTC_VERSION}-"
+          {
+            echo "key_prefix=$PREFIX"
+            echo "key_manifest=${PREFIX}${VCPKG_MANIFEST_HASH}-"
+          } >> "$GITHUB_OUTPUT"
 
           {
             echo "VCPKG_ROOT=$GITHUB_WORKSPACE/third_party/vcpkg"
@@ -153,60 +167,73 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Restore cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.ccache
             ~/.cargo/registry
             ~/.cargo/git
-            ~/.rustup
             third_party/vcpkg/downloads
             app/src/main/cpp/emucorev/ECV/vcpkg_installed
-          key: emucorev-${{ runner.os }}-${{ inputs.build_type }}-${{ env.NDK_VERSION }}-${{ env.RUST_VERSION }}-${{ steps.setup.outputs.hash }}-${{ hashFiles('app/src/main/cpp/emucorev/ECV/vcpkg.json') }}
+          key: ${{ steps.setup.outputs.key_manifest }}${{ github.run_id }}
           restore-keys: |
-            emucorev-${{ runner.os }}-${{ inputs.build_type }}-${{ env.NDK_VERSION }}-${{ env.RUST_VERSION }}-${{ steps.setup.outputs.hash }}-
-            emucorev-${{ runner.os }}-${{ inputs.build_type }}-${{ env.NDK_VERSION }}-${{ env.RUST_VERSION }}-
+            ${{ steps.setup.outputs.key_manifest }}
+            ${{ steps.setup.outputs.key_prefix }}
 
       - name: Install native deps
         timeout-minutes: 60
         working-directory: app/src/main/cpp/emucorev/ECV
         run: |
           "$VCPKG_ROOT/vcpkg" install --triplet arm64-android --host-triplet x64-linux
+
           PREFIX="$PWD/vcpkg_installed/arm64-android"
           OUT="$GITHUB_WORKSPACE/tools/openssl-test/out"
-          mkdir -p "$(dirname "$OUT")" && rm -rf "$OUT" && ln -s "$PREFIX" "$OUT"
+          mkdir -p "$(dirname "$OUT")"
+          rm -rf "$OUT"
+          ln -s "$PREFIX" "$OUT"
 
       - name: Build APK
         timeout-minutes: 120
-        env:
-          BUILD_TYPE: ${{ inputs.build_type }}
         run: |
+          ccache -z
           chmod +x ./gradlew
           ./gradlew ":app:assemble${BUILD_TYPE^}" --parallel --build-cache --stacktrace
 
-      - name: Package & verify APK
+      - name: ccache statistics
+        if: always()
+        run: ccache -s || true
+
+      - name: Save cache
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.ccache
+            ~/.cargo/registry
+            ~/.cargo/git
+            third_party/vcpkg/downloads
+            app/src/main/cpp/emucorev/ECV/vcpkg_installed
+          key: ${{ steps.setup.outputs.key_manifest }}${{ github.run_id }}
+
+      - name: Package and verify APK
         env:
-          BUILD_TYPE: ${{ inputs.build_type }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
-          set -eo pipefail
           SRC_APK="$(find "app/build/outputs/apk/$BUILD_TYPE" -maxdepth 1 \
                        -name '*.apk' ! -name '*-unsigned.apk' -print -quit)"
           [ -n "$SRC_APK" ] || { echo "::error::Signed APK not found"; exit 1; }
 
           mkdir -p dist
           DEST="dist/EmuCoreV-${BUILD_TYPE}-${RUN_NUMBER}.apk"
-          BUILD_TOOLS="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION"
-
           cp "$SRC_APK" "$DEST"
 
-          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$DEST"
+          "$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/apksigner" verify --verbose --print-certs "$DEST"
 
       - name: Cleanup sensitive files
         if: always()
         run: |
           rm -rf "$RUNNER_TEMP/signing"
-          rm -f local.properties
+          rm -f local.properties app/google-services.json
 
       - uses: actions/upload-artifact@v4
         with:
@@ -214,4 +241,4 @@ jobs:
           path: dist/*.apk
           compression-level: 0
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 1
