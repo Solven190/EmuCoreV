@@ -96,6 +96,11 @@ class AppPreferences(context: Context) {
             2 -> ThemeMode.DARK
             3 -> if (proUnlocked) ThemeMode.PRO else ThemeMode.SYSTEM
             4 -> ThemeMode.NEON
+            5 -> when {
+                prefs.getString(KEY_THEME_PACKAGE_ID, null).isNullOrBlank() -> ThemeMode.SYSTEM
+                prefs.getBoolean(KEY_THEME_PACKAGE_REQUIRES_PRO, false) && !proUnlocked -> ThemeMode.SYSTEM
+                else -> ThemeMode.PACKAGE
+            }
             else -> ThemeMode.SYSTEM
         }
         set(value) {
@@ -109,6 +114,9 @@ class AppPreferences(context: Context) {
                         ThemeMode.DARK -> 2
                         ThemeMode.PRO -> 3
                         ThemeMode.NEON -> 4
+                        // Packages are applied through applyThemePackage(); keep the stored id.
+                        ThemeMode.PACKAGE ->
+                            if (prefs.getString(KEY_THEME_PACKAGE_ID, null).isNullOrBlank()) 0 else 5
                     }
                 )
             }
@@ -118,7 +126,9 @@ class AppPreferences(context: Context) {
         get() = callbackFlow {
             trySend(themeMode)
             val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-                if (key == KEY_THEME_MODE || key == KEY_PRO_UNLOCKED) {
+                if (key == KEY_THEME_MODE || key == KEY_PRO_UNLOCKED ||
+                    key == KEY_THEME_PACKAGE_ID || key == KEY_THEME_PACKAGE_REQUIRES_PRO
+                ) {
                     trySend(themeMode)
                 }
             }
@@ -126,10 +136,102 @@ class AppPreferences(context: Context) {
             awaitClose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
         }.distinctUntilChanged()
 
+    val themePackageId: String?
+        get() = prefs.getString(KEY_THEME_PACKAGE_ID, null)
+
+    /** Id of the applied Store controls skin pack (see data/store/StoreControlSkins), or null. */
+    val touchControlSkinPack: Flow<String?>
+        get() = callbackFlow {
+            trySend(prefs.getString(KEY_TOUCH_CONTROL_SKIN_PACK, null)?.takeIf { it.isNotBlank() })
+            val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+                if (key == KEY_TOUCH_CONTROL_SKIN_PACK) {
+                    trySend(prefs.getString(KEY_TOUCH_CONTROL_SKIN_PACK, null)?.takeIf { it.isNotBlank() })
+                }
+            }
+            prefs.registerOnSharedPreferenceChangeListener(listener)
+            awaitClose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+        }.distinctUntilChanged()
+
+    fun setTouchControlSkinPack(id: String?) {
+        prefs.edit {
+            if (id.isNullOrBlank()) remove(KEY_TOUCH_CONTROL_SKIN_PACK) else putString(KEY_TOUCH_CONTROL_SKIN_PACK, id)
+        }
+    }
+
+    /**
+     * Remembers which Store font was copied into the custom-font slot and where, so the Store can tell
+     * whether that font is still the selected one. Null clears it.
+     */
+    fun setStoreFont(id: String?, path: String?) {
+        prefs.edit {
+            if (id.isNullOrBlank() || path.isNullOrBlank()) {
+                remove(KEY_STORE_FONT_ID)
+                remove(KEY_STORE_FONT_PATH)
+            } else {
+                putString(KEY_STORE_FONT_ID, id)
+                putString(KEY_STORE_FONT_PATH, path)
+            }
+        }
+    }
+
+    /** (Store font id, custom-font path it was installed to), or null. */
+    val storeFont: Flow<Pair<String, String>?>
+        get() = callbackFlow {
+            fun read(): Pair<String, String>? {
+                val id = prefs.getString(KEY_STORE_FONT_ID, null)?.takeIf { it.isNotBlank() } ?: return null
+                val path = prefs.getString(KEY_STORE_FONT_PATH, null)?.takeIf { it.isNotBlank() } ?: return null
+                return id to path
+            }
+            trySend(read())
+            val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+                if (key == KEY_STORE_FONT_ID || key == KEY_STORE_FONT_PATH) trySend(read())
+            }
+            prefs.registerOnSharedPreferenceChangeListener(listener)
+            awaitClose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+        }.distinctUntilChanged()
+
+    /** Id of the applied theme package; meaningful only while [themeMode] is PACKAGE. */
+    val themePackageIdFlow: Flow<String?>
+        get() = callbackFlow {
+            trySend(prefs.getString(KEY_THEME_PACKAGE_ID, null))
+            val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+                if (key == KEY_THEME_PACKAGE_ID) trySend(prefs.getString(KEY_THEME_PACKAGE_ID, null))
+            }
+            prefs.registerOnSharedPreferenceChangeListener(listener)
+            awaitClose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+        }.distinctUntilChanged()
+
+    /**
+     * Applies an installed theme package. Pro-only packages are refused without Pro, like the
+     * built-in Pro theme. Returns false when refused.
+     */
+    fun applyThemePackage(id: String, requiresPro: Boolean): Boolean {
+        if (requiresPro && !proUnlocked) return false
+        prefs.edit {
+            putString(KEY_THEME_PACKAGE_ID, id)
+            putBoolean(KEY_THEME_PACKAGE_REQUIRES_PRO, requiresPro)
+            putInt(KEY_THEME_MODE, 5)
+        }
+        return true
+    }
+
+    /** Called when an installed package is deleted: falls back to SYSTEM if it was applied. */
+    fun clearThemePackage(id: String) {
+        if (prefs.getString(KEY_THEME_PACKAGE_ID, null) != id) return
+        prefs.edit {
+            remove(KEY_THEME_PACKAGE_ID)
+            remove(KEY_THEME_PACKAGE_REQUIRES_PRO)
+            if (prefs.getInt(KEY_THEME_MODE, 0) == 5) putInt(KEY_THEME_MODE, 0)
+        }
+    }
+
     var proUnlocked: Boolean
         get() = prefs.getBoolean(KEY_PRO_UNLOCKED, false)
         set(value) {
-            val resetProTheme = !value && prefs.getInt(KEY_THEME_MODE, 0) == 3
+            val resetProTheme = !value && (
+                prefs.getInt(KEY_THEME_MODE, 0) == 3 ||
+                    (prefs.getInt(KEY_THEME_MODE, 0) == 5 && prefs.getBoolean(KEY_THEME_PACKAGE_REQUIRES_PRO, false))
+                )
             prefs.edit {
                 putBoolean(KEY_PRO_UNLOCKED, value)
                 if (resetProTheme) {
@@ -357,6 +459,11 @@ class AppPreferences(context: Context) {
         private const val KEY_VITA_STORAGE_ROOT_PATH = "vita_storage_root_path"
         private const val KEY_ONBOARDING_COMPLETED = "onboarding_completed"
         private const val KEY_THEME_MODE = "theme_mode"
+        private const val KEY_THEME_PACKAGE_ID = "theme_package_id"
+        private const val KEY_TOUCH_CONTROL_SKIN_PACK = "touch_control_skin_pack"
+        private const val KEY_STORE_FONT_ID = "store_font_id"
+        private const val KEY_STORE_FONT_PATH = "store_font_path"
+        private const val KEY_THEME_PACKAGE_REQUIRES_PRO = "theme_package_requires_pro"
         private const val KEY_PRO_UNLOCKED = "pro_unlocked"
         private const val KEY_WELCOME_DIALOG_SHOWN = "welcome_dialog_shown"
         private const val KEY_PRO_REMINDER_LAST_SHOWN_AT_MS = "pro_reminder_last_shown_at_ms"

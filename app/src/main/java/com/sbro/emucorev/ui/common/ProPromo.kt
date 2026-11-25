@@ -29,13 +29,13 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Insights
 import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.Star
-import androidx.compose.material3.Button
+import com.sbro.emucorev.ui.theme.style.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
+import com.sbro.emucorev.ui.theme.style.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
+import com.sbro.emucorev.ui.theme.style.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -187,7 +187,7 @@ fun ProPromoCard(
         Row(
             modifier = Modifier
                 .height(22.dp)
-                .clip(if (neon) neonChipShape() else RoundedCornerShape(50))
+                .clip(if (neon) neonChipShape() else neonShape(999.dp))
                 .background(if (neon) Brush.horizontalGradient(listOf(NeonYellow, NeonYellow))
                     else Brush.horizontalGradient(listOf(Color(0xFFF6D06B), Color(0xFFD99A2B))))
                 .padding(horizontal = 8.dp),

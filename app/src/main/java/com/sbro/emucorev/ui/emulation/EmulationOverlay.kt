@@ -55,7 +55,7 @@ import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
+import com.sbro.emucorev.ui.theme.style.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -722,6 +722,9 @@ fun EmulationOverlayHost(
             LabSession.statsOverlayAllowed,
             titleId = gameId)
         if (showTouchControls && inputResumed) {
+            androidx.compose.runtime.CompositionLocalProvider(
+                com.sbro.emucorev.ui.common.LocalControlSkin provides com.sbro.emucorev.ui.common.rememberAppliedControlSkin()
+            ) {
             OnScreenControls(
                 modifier = Modifier.fillMaxSize(),
                 overlayScale = config.overlayScale,
@@ -757,6 +760,7 @@ fun EmulationOverlayHost(
                 onButtonChange = { button, pressed -> overlayBridge.sendButton(button, pressed) },
                 onAxisChange = { axis, value -> overlayBridge.sendAxis(axis, value) }
             )
+            }
         }
 
         if (inputResumed && !effectivePaused && !nativeImeActive && !waitingForStateFrame && !activity.exitInProgress) {

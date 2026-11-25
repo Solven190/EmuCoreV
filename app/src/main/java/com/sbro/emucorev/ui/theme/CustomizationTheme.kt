@@ -1,6 +1,5 @@
 package com.sbro.emucorev.ui.theme
 
-import android.graphics.Typeface
 import androidx.compose.material3.Typography
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
@@ -14,6 +13,7 @@ import androidx.compose.ui.unit.sp
 import com.sbro.emucorev.R
 import com.sbro.emucorev.data.AppFont
 import com.sbro.emucorev.data.CustomizationSettings
+import java.io.File
 
 private val RubikFontFamily = FontFamily(
     Font(R.font.rubik_variable, FontWeight.Normal),
@@ -35,9 +35,9 @@ internal fun rememberCustomizedTypography(settings: CustomizationSettings): Typo
         AppFont.SYSTEM -> FontFamily.Default
         AppFont.RUBIK -> RubikFontFamily
         AppFont.EXO2 -> Exo2FontFamily
-        AppFont.CUSTOM -> remember(settings.customFontPath) {
+        AppFont.CUSTOM -> remember(settings.customFontPath, settings.customFontPath?.let { File(it).lastModified() }) {
             settings.customFontPath?.let { path ->
-                runCatching { FontFamily(Typeface.createFromFile(path)) }.getOrNull()
+                runCatching { fileFontFamily(File(path)) }.getOrNull()
             }
         }
     }
