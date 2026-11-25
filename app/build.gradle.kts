@@ -1,7 +1,10 @@
 @file:Suppress("UnstableApiUsage", "DEPRECATION")
 
+import com.android.build.api.artifact.SingleArtifact
 import java.io.File
 import java.util.Properties
+import java.security.MessageDigest
+import java.util.zip.ZipFile
 
 val androidOpenSslRoot = rootProject.layout.projectDirectory.dir("tools/openssl-test/out").asFile
 val emuCoreVNativeHook = project.layout.projectDirectory.file("src/main/cpp/emucorev/cmake/ECVProjectHook.cmake").asFile
@@ -73,8 +76,8 @@ run {
     if (vcpkgRoot.exists()) setEnv("VCPKG_ROOT", vcpkgRoot.absolutePath.replace('\\', '/'))
 }
 
-// The native PS Vita shell module exists only when its local resource pack does
-// (see settings.gradle.kts); otherwise library mode keeps the Compose carousel.
+// The native PS Vita shell module (see settings.gradle.kts). It is always built; the
+// library mode is only offered once firmware is installed (NativeLibraryMode.available).
 val nativeShellAvailable = rootProject.findProject(":native-ui-shell") != null
 
 plugins {
@@ -322,6 +325,53 @@ if (releaseCleanChecker.isFile) {
                     "artifact was NOT scanned for research/oracle tooling.")
             }
         }
+    }
+}
+
+// B028: no firmware-derived shell data may ship in the APK. The native shell builds its
+// resource pack on the device from the user's installed firmware, so the APK must contain
+// none of the Sony containers/fonts/sounds the former bundled pack held.
+androidComponents {
+    onVariants { variant ->
+        val apkDirectory = variant.artifacts.get(SingleArtifact.APK)
+        val variantName = variant.name.replaceFirstChar { it.uppercase() }
+        val verifyNoFirmwareData = tasks.register("verify${variantName}ApkHasNoFirmwareData") {
+            inputs.dir(apkDirectory)
+            doLast {
+                val forbiddenExtensions = listOf(".rco", ".gim", ".pvf", ".wav", ".vag", ".dds", ".otf", ".at9")
+                val allowedFontPrefixes = listOf("assets/data/fonts/", "res/font/")
+                val forbiddenNames = setOf("images.json", "fonts.json", "sounds.json", "effects.json", "lookups.json",
+                    "startup-busy.png")
+                // Our own OFL fonts (res/font) are renamed by release resource shrinking (res/8P.ttf):
+                // a .ttf anywhere is allowed only when its bytes equal one of them.
+                val ownFontHashes = project.file("src/main/res/font").listFiles().orEmpty()
+                    .filter { it.isFile }
+                    .map { MessageDigest.getInstance("SHA-256").digest(it.readBytes()).joinToString("") { b -> "%02x".format(b) } }
+                    .toSet()
+                val offenders = mutableListOf<String>()
+                apkDirectory.get().asFile.walkTopDown().filter { it.isFile && it.extension == "apk" }.forEach { apk ->
+                    ZipFile(apk).use { zip ->
+                        for (entry in zip.entries()) {
+                            val name = entry.name.lowercase()
+                            val leaf = name.substringAfterLast('/')
+                            val ownFont = name.endsWith(".ttf") && zip.getInputStream(entry).use { input ->
+                                MessageDigest.getInstance("SHA-256").digest(input.readBytes())
+                                    .joinToString("") { b -> "%02x".format(b) }
+                            } in ownFontHashes
+                            val bad = name.startsWith("assets/native-ui") ||
+                                forbiddenExtensions.any { name.endsWith(it) } ||
+                                (name.endsWith(".ttf") && !ownFont && allowedFontPrefixes.none { name.startsWith(it) }) ||
+                                leaf in forbiddenNames
+                            if (bad) offenders += "${apk.name}: ${entry.name}"
+                        }
+                    }
+                }
+                check(offenders.isEmpty()) {
+                    "APK contains firmware-derived shell data (B028):\n" + offenders.joinToString("\n")
+                }
+            }
+        }
+        tasks.matching { it.name == "assemble$variantName" }.configureEach { dependsOn(verifyNoFirmwareData) }
     }
 }
 

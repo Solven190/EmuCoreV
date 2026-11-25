@@ -4,6 +4,7 @@ import android.content.Intent
 import android.widget.Toast
 import com.sbro.emucorev.MainActivity
 import com.sbro.emucorev.R
+import com.sbro.emucorev.core.EmulatorStorage
 import com.sbro.emucorev.core.SaveStateRepository
 import com.sbro.emucorev.core.VitaLaunchBridge
 import com.sbro.emucorev.nativeui.shell.ShellSaveGame
@@ -33,6 +34,8 @@ import kotlinx.coroutines.launch
 class NativeShellHostActivity : NativeShellActivity(), NativeLibraryMode.ReturnTarget {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val launching = AtomicBoolean(false)
+
+    override fun firmwareRoot(): File = EmulatorStorage.vitaRoot(this)
 
     override fun loadCatalog(): List<BundledImages.HomeCatalogSource> =
         InstalledGameRepository().loadInstalledGames(this).mapNotNull { game ->
@@ -124,8 +127,12 @@ class NativeShellHostActivity : NativeShellActivity(), NativeLibraryMode.ReturnT
         }
     }
 
+    private var exitDialog: NativeLibraryExitDialog? = null
+
     override fun onExitRequested() {
-        NativeLibraryExitDialog(this) {
+        // Back pressed again (or Settings > exit) while the confirmation is up must not stack a second dialog.
+        if (exitDialog?.isShowing == true || isFinishing || isDestroyed) return
+        exitDialog = NativeLibraryExitDialog(this) {
             NativeLibraryMode.setSelected(this, false)
             startActivity(Intent(this, MainActivity::class.java).apply {
                 action = Intent.ACTION_MAIN
@@ -134,12 +141,15 @@ class NativeShellHostActivity : NativeShellActivity(), NativeLibraryMode.ReturnT
                 putExtra(NativeLibraryMode.EXIT_NATIVE_LIBRARY, true)
             })
             finish()
-        }.show()
+        }.also { it.show() }
     }
 
     private fun toast(message: Int) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
 
     override fun onDestroy() {
+        // A dialog that outlives its Activity leaks its window.
+        exitDialog?.dismiss()
+        exitDialog = null
         scope.cancel()
         super.onDestroy()
     }

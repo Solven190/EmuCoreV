@@ -37,7 +37,7 @@ get_filename_component(ECV_ORACLE_HOOKS_DIR "${EMUCOREV_BRIDGE_DIR}/../../../../
 if(ECV_ORACLE AND EXISTS "${ECV_ORACLE_HOOKS_DIR}/ecv_oracle.h")
     file(GLOB ECV_ORACLE_SOURCES CONFIGURE_DEPENDS "${ECV_ORACLE_HOOKS_DIR}/*.cpp")
     target_sources(ECV PRIVATE ${ECV_ORACLE_SOURCES})
-    foreach(oracle_target ECV kernel renderer mem)
+    foreach(oracle_target ECV kernel renderer mem audio)
         target_include_directories(${oracle_target} PRIVATE "${ECV_ORACLE_HOOKS_DIR}")
         target_compile_definitions(${oracle_target} PRIVATE ECV_ORACLE=1)
     endforeach()
@@ -83,6 +83,7 @@ set(EMUCOREV_BRIDGE_SOURCES
     "${EMUCOREV_BRIDGE_DIR}/src/native_library_runtime.cpp"
     "${EMUCOREV_BRIDGE_DIR}/src/layer_contract.cpp"
     "${EMUCOREV_BRIDGE_DIR}/src/vita_install_bridge.cpp"
+    "${EMUCOREV_BRIDGE_DIR}/src/firmware_installer.cpp"
     "${EMUCOREV_BRIDGE_DIR}/src/runtime_bridge.cpp"
     "${EMUCOREV_BRIDGE_DIR}/src/live_resolution.cpp"
     "${EMUCOREV_BRIDGE_DIR}/src/stats_bridge.cpp"
@@ -111,6 +112,8 @@ target_sources(ECV PRIVATE ${EMUCOREV_BRIDGE_SOURCES})
 target_sources(ECV PRIVATE $<$<CONFIG:Debug>:${EMUCOREV_BRIDGE_DIR}/src/shell_firmware_research.cpp>)
 target_include_directories(modules PRIVATE "${EMUCOREV_BRIDGE_DIR}/include")
 target_link_libraries(ECV PRIVATE regmgr)
+# firmware_installer.cpp decrypts PUP segments with OpenSSL.
+target_link_libraries(ECV PRIVATE crypto)
 
 # These private diagnostic archives expose no JNI API. Hide their symbols so
 # section GC can discard unused logging/debug-server implementations in release.
