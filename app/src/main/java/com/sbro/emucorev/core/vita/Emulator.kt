@@ -169,6 +169,7 @@ open class Emulator : SDLActivity(), InputManager.InputDeviceListener {
     private var overlayBackHandler: (() -> Boolean)? = null
     private var overlayMenuButtonRevealHandler: (() -> Unit)? = null
     private var overlayPauseMenuOpenHandler: (() -> Unit)? = null
+    private var overlayMenuKeyHandler: ((KeyEvent) -> Boolean)? = null
     private var menuPaused: Boolean = false
     private var nativeThreadPaused: Boolean = false
     private var playTimeSessionId: String? = null
@@ -337,6 +338,13 @@ open class Emulator : SDLActivity(), InputManager.InputDeviceListener {
     fun setOverlayBackHandler(handler: (() -> Boolean)?) {
         overlayBackHandler = handler
     }
+
+    /** While the pause menu is open the Activity routes controller keys into it (its window is not focusable). */
+    fun setOverlayMenuKeyHandler(handler: ((KeyEvent) -> Boolean)?) {
+        overlayMenuKeyHandler = handler
+    }
+
+    fun dispatchOverlayBack(): Boolean = overlayBackHandler?.invoke() == true
 
     fun setOverlayMenuButtonRevealHandler(handler: (() -> Unit)?) {
         overlayMenuButtonRevealHandler = handler
@@ -636,7 +644,7 @@ open class Emulator : SDLActivity(), InputManager.InputDeviceListener {
             }
         }
         requestRetroArchShaderReapply(currentGameIdOrIntent())
-        com.sbro.emucorev.core.input.RearTouchNative.setCamerasSuspended(false)
+        setPeripheralsSuspended(false)
         KeyboardMouseManager.refreshConnectionState()
         KeyboardMouseManager.refreshPointerCapture()
         DiscordIntegration.setPaused(false)
@@ -655,7 +663,7 @@ open class Emulator : SDLActivity(), InputManager.InputDeviceListener {
         inputGateWatchdog.setPaused(true)
         shellCatalogCheckJob?.cancel()
         rearTouchInput.setActive(false)
-        com.sbro.emucorev.core.input.RearTouchNative.setCamerasSuspended(true)
+        setPeripheralsSuspended(true)
         KeyboardMouseManager.releaseAll()
         updatePointerCapture(false)
         cancelActiveTouches()
@@ -1125,6 +1133,12 @@ open class Emulator : SDLActivity(), InputManager.InputDeviceListener {
      */
     external fun setLiveResolutionMultiplier(multiplier: Float): Boolean
 
+    /**
+     * Like [setLiveResolutionMultiplier] but only changes the session at a frame boundary unless [allowMidScene]:
+     * 1 applied, 0 failed, 2 a scene is open (nothing changed, retry after the guest has run a little).
+     */
+    external fun setLiveResolutionMultiplierAtBoundary(multiplier: Float, allowMidScene: Boolean): Int
+
     /** Apply a screen filter name (as stored in the profile) to the running session. */
     external fun setLiveScreenFilter(filter: String)
 
@@ -1213,7 +1227,49 @@ open class Emulator : SDLActivity(), InputManager.InputDeviceListener {
 
     fun updateGamepadRuntimeInputSettings(config: VitaCoreConfig) {
         SDLControllerManager.updateRuntimeInputSettings(config)
+        applyMicrophoneSettings(config)
     }
+
+    /**
+     * Menu pause / background: releases the host camera and microphone (the OS privacy indicators go off)
+     * and lets the guest threads re-open them lazily after the resume. Safe before the session exists.
+     */
+    fun setPeripheralsSuspended(suspended: Boolean) {
+        com.sbro.emucorev.core.input.RearTouchNative.setCamerasSuspended(suspended)
+        runCatching { setMicrophoneSuspended(suspended) }
+        if (suspended) com.sbro.emucorev.core.MicrophoneSupport.clearRouting(this)
+    }
+
+    @Volatile
+    private var micRouteDeviceId = 0
+
+    /** Pushes the effective (global or per-game) microphone settings into the core. */
+    private fun applyMicrophoneSettings(config: VitaCoreConfig) {
+        val devices = com.sbro.emucorev.core.MicrophoneSupport.listInputDevices(this)
+        val deviceId = com.sbro.emucorev.core.resolveMicDeviceId(config.micInputDevice, devices)
+        micRouteDeviceId = deviceId
+        runCatching { setMicrophoneSettings(config.micEnabled, config.micGainPercent, deviceId) }
+            .onFailure { Log.w(TAG, "Microphone settings not applied yet", it) }
+    }
+
+    /** JNI (guest thread, just before the capture stream opens): route a Bluetooth headset microphone. */
+    @Suppress("unused")
+    fun prepareMicrophoneRouting() {
+        val id = micRouteDeviceId
+        com.sbro.emucorev.core.MicrophoneSupport.applyRouting(
+            this, if (id > 0) com.sbro.emucorev.core.MicrophoneSupport.deviceInfo(this, id) else null
+        )
+    }
+
+    /** JNI (guest thread): the capture port was released. */
+    @Suppress("unused")
+    fun releaseMicrophoneRouting() {
+        com.sbro.emucorev.core.MicrophoneSupport.clearRouting(this)
+    }
+
+    private external fun setMicrophoneSettings(enabled: Boolean, gainPercent: Int, deviceId: Int)
+
+    private external fun setMicrophoneSuspended(suspended: Boolean)
 
     @Deprecated("Deprecated in Java")
     @SuppressLint("GestureBackNavigation")
@@ -1254,6 +1310,7 @@ open class Emulator : SDLActivity(), InputManager.InputDeviceListener {
                 else -> true
             }
         }
+        if (overlayMenuKeyHandler?.invoke(event) == true) return true
         if (rearTouchInput.key(event)) return true
         if (KeyboardMouseManager.handleKeyBindingCapture(event)) return true
         if (!nativeKeyboardRequested && KeyboardMouseManager.handleKeyEvent(event)) return true

@@ -20,6 +20,7 @@
 #include <renderer/texture_cache.h>
 
 #include <renderer/types.h>
+#include <renderer/vulkan/depth_stencil_model.h>
 #include <shader/uniform_block.h>
 #include <renderer/vulkan/frame_command_buffer_cursor.h>
 #include <unordered_map>
@@ -324,6 +325,23 @@ struct VKContext : public renderer::Context {
     vk::RenderPass current_render_pass;
     vk::RenderPass current_shader_interlock_pass = nullptr;
     vk::Pipeline current_pipeline;
+    // second pipeline of a draw split by facing (see dsmodel::FacePlan), null when the draw is a single pass
+    vk::Pipeline split_pipeline = nullptr;
+    dsmodel::FacePlan face_plan = dsmodel::FacePlan::Front;
+
+    // P5 depth/stencil model, set when the scene begins from the GXM depth/stencil surface
+    vk::Format ds_host_format = vk::Format::eUndefined;
+    // the guest surface has a depth / stencil aspect and the host format can hold it (otherwise that test is off, like on the Vita)
+    bool ds_depth_test = true;
+    bool ds_stencil_test = true;
+    // GXM bias units -> host bias units (depends on the precision of the host depth format)
+    float ds_bias_units_scale = 1.0f;
+    // front values are mirrored in record.depth_bias_*, which also survives a save state; the back values only live here
+    dsmodel::DepthBiasFaces depth_bias;
+    // last bias set on the command buffer, dedupes the per-face updates of split draws
+    dsmodel::DepthBias applied_bias;
+    float applied_bias_scale = 1.0f;
+    bool applied_bias_valid = false;
 
     vk::Framebuffer current_framebuffer;
     vk::Framebuffer current_shader_interlock_framebuffer = nullptr;
@@ -337,6 +355,7 @@ struct VKContext : public renderer::Context {
     bool in_renderpass = false;
     bool refresh_pipeline = false;
     bool is_first_scene_draw = false;
+    bool prev_draw_fbfetch = false; // the previous draw of this render pass instance read the framebuffer (subpass input)
     // command buffer used to record the current scene
     vk::CommandBuffer render_cmd{};
     // command buffer used for commands that need to be executed before render_cmd (mostly because they can't be done during a render pass)
@@ -420,6 +439,9 @@ struct VKRenderTarget : public renderer::RenderTarget {
     void prepare_resize(VKState &state, float multiplier, ResizedImages &out) const;
     // The GPU must be idle and every framebuffer that used the old images destroyed.
     void commit_resize(float multiplier, ResizedImages &&images);
+    // The GPU must be idle. Blit-scales the current colour and depth/stencil contents into `images` (nearest filter,
+    // skipped for a format that cannot be blitted) so a scene continues on the pixels it already had.
+    void scale_contents_into(VKState &state, ResizedImages &images);
 
     // sync objects
     std::vector<vk::Fence> fences;
