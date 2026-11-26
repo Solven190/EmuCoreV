@@ -31,6 +31,8 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct SceGxmProgram;
@@ -68,6 +70,8 @@ class PipelineCache {
     friend struct VKState;
 
 public:
+    // cull mode of a draw of this variant (a split draw culls the other facing on top of the guest mode)
+    static vk::CullModeFlags draw_cull_mode(SceGxmCullMode guest, dsmodel::PassVariant variant);
     void force_sync_compilation_for(std::chrono::milliseconds duration) {
         const auto until = std::chrono::steady_clock::now() + duration;
         sync_compile_until_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(until.time_since_epoch()).count(), std::memory_order_release);
@@ -118,6 +122,15 @@ private:
     // each entry is compiled by one thread, the others wait on its gate (never touch it without the gate)
     unordered_map_stable<Sha256Hash, CompileGate<vk::ShaderModule>> shaders;
     unordered_map_stable<uint64_t, vk::Pipeline> pipelines;
+    // P14: a second, independently seeded 64-bit hash of the same state per pipeline key. Together they make the identity 128 bits wide;
+    // a key whose check differs is a collision between two different states and is re-keyed instead of reusing the wrong pipeline.
+    std::unordered_map<uint64_t, uint64_t> pipeline_checks;
+
+    // no memory mapping: modules whose guest buffer container is written by the shader (buffer_store_model.h), and for each pipeline which of its
+    // stages (buffer_store::Stage bits) hold such a module; both under shaders_mutex
+    std::unordered_set<VkShaderModule> container_writable_modules;
+    std::unordered_map<VkPipeline, uint8_t> pipeline_store_stages;
+    void note_module_stores(vk::ShaderModule module, const uint32_t *words, size_t count);
 
     // reads a precompiled module from the shader cache directory, does not touch the shaders map
     vk::ShaderModule load_cached_shader_module(const Sha256Hash &hash);
@@ -132,12 +145,15 @@ private:
     // each pipeline compiler thread uses this function as its entrypoint
     void compiler_thread(MemState &mem);
 
-    vk::Pipeline compile_pipeline(SceGxmPrimitiveType type, vk::RenderPass render_pass, const SceGxmVertexProgram &vertex_program_gxm, const SceGxmFragmentProgram &fragment_program_gxm, const ProgramSource &vertex_source, const ProgramSource &fragment_source, const GxmRecordState &record, const shader::Hints &hints, MemState &mem, const PipelineDsInfo &ds, dsmodel::PassVariant variant);
+    vk::Pipeline compile_pipeline(SceGxmPrimitiveType type, vk::RenderPass render_pass, const SceGxmVertexProgram &vertex_program_gxm, const SceGxmFragmentProgram &fragment_program_gxm, const ProgramSource &vertex_source, const ProgramSource &fragment_source, const GxmRecordState &record, const shader::Hints &hints, MemState &mem, const PipelineDsInfo &ds, dsmodel::PassVariant variant, vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1);
 
 public:
     bool uses_coherent_framebuffer_fetch() const { return support_coherent_framebuffer_fetch; }
     // if not 0, next time the pipeline cache should be saved (in seconds since epoch)
     uint64_t next_pipeline_cache_save = std::numeric_limits<uint64_t>::max();
+    // periodic save: a session that ends with a kill (lab runs, crashes) still leaves the cache of the last 30 s behind
+    size_t last_saved_pipeline_count = 0;
+    uint64_t last_save_time_s = 0;
 
     // modified by the surface cache, estimates if it is safe to use async pipeline compilation
     // (i.e that it does not causes permanent graphical issues)
@@ -161,6 +177,8 @@ public:
     void save_pipeline_cache();
 
     vk::RenderPass retrieve_render_pass(vk::Format format, bool depth_load, bool stencil_load, bool force_store, bool is_color_transient, bool no_color = false, bool has_raw_attachment = false, vk::Format ds_format = vk::Format::eUndefined);
+    // stage bits (buffer_store::Stage) of the pipeline whose shader stores into the guest buffers (always 0 with memory mapping)
+    uint8_t pipeline_buffer_stores(vk::Pipeline pipeline);
     vk::Pipeline retrieve_pipeline(VKContext &context, SceGxmPrimitiveType &type, bool consider_for_async, MemState &mem, dsmodel::PassVariant variant = dsmodel::PassVariant::Front);
 
     vk::ShaderModule precompile_shader(const Sha256Hash &hash, bool search_first = true);

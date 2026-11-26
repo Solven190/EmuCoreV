@@ -44,7 +44,7 @@ struct SceGxmColorSurface {
         uint32_t gamma : 2;
         uint32_t clip_x_min : 12;
         uint32_t clip_y_min : 12;
-        uint32_t dither : 1; // SCE_GXM_COLOR_SURFACE_DITHER_ENABLED (stored for Get/SetDitherMode, not rendered)
+        uint32_t dither : 1; // SCE_GXM_COLOR_SURFACE_DITHER_ENABLED (Get/SetDitherMode; the fragment shader dithers low-precision surfaces)
         uint32_t : 3;
     };
     uint16_t width;
@@ -282,6 +282,9 @@ struct GxmContextState {
     bool visibility_enable = false;
     uint32_t visibility_index;
     bool visibility_is_increment = false;
+    bool visibility_back_enable = false;
+    uint32_t visibility_back_index = 0;
+    bool visibility_back_is_increment = false;
 
     bool active = false;
 };

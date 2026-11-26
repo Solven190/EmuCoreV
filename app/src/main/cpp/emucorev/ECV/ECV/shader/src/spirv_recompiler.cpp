@@ -116,6 +116,8 @@ struct TranslationState {
     spv::Id mask_id = spv::NoResult;
     spv::Id frag_coord_id = spv::NoResult;
     spv::Id front_facing_id = spv::NoResult;
+    spv::Id point_coord_private_id = spv::NoResult;
+    spv::Id point_coord_input_id = spv::NoResult; // gl_PointCoord, copied (with the polygon mode flips) to the private variable the textures read
     spv::Id render_info_id = spv::NoResult;
     std::vector<VarToReg> var_to_regs;
     std::vector<spv::Id> interfaces;
@@ -161,6 +163,57 @@ static bool program_packs_bytes(const SceGxmProgram &program) {
 
 static bool is_u8_alpha_color_surface(const TranslationState &state) {
     return state.hints->color_format == SCE_GXM_COLOR_FORMAT_U8_A;
+}
+
+// GXM dithers the colour written to a surface with less than 8 bits per channel when the surface's dither bit is set.
+// The exact hardware pattern is not recovered: PROVISIONAL ordered 4x4 Bayer dither of one quantisation step of the
+// channel, applied before the (host) quantisation. Formats of 8 bits and more emit no code at all.
+static spv::Id apply_surface_dither(spv::Builder &b, const TranslationState &state, const spv::Id color) {
+    float amp[4];
+    switch (gxm::get_base_format(state.hints->color_format)) {
+    case SCE_GXM_COLOR_BASE_FORMAT_U5U6U5:
+        amp[0] = 1.0f / 31.0f, amp[1] = 1.0f / 63.0f, amp[2] = 1.0f / 31.0f, amp[3] = 0.0f;
+        break;
+    case SCE_GXM_COLOR_BASE_FORMAT_U1U5U5U5:
+        amp[0] = amp[1] = amp[2] = 1.0f / 31.0f, amp[3] = 0.0f;
+        break;
+    case SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4:
+        amp[0] = amp[1] = amp[2] = amp[3] = 1.0f / 15.0f;
+        break;
+    default:
+        return color;
+    }
+    const spv::Id f32 = b.makeFloatType(32);
+    const spv::Id u32 = b.makeUintType(32);
+    const spv::Id v4 = b.makeVectorType(f32, 4);
+    const spv::Id coord = b.createLoad(state.frag_coord_id, spv::NoPrecision);
+    const auto pixel = [&](const unsigned comp) {
+        const spv::Id c = b.createCompositeExtract(coord, f32, comp);
+        const spv::Id u = b.createUnaryOp(spv::OpConvertFToU, u32, c);
+        return b.createBinOp(spv::OpBitwiseAnd, u32, u, b.makeUintConstant(3));
+    };
+    const auto bit = [&](const spv::Id value, const unsigned shift_right, const unsigned shift_left) {
+        spv::Id v = shift_right ? b.createBinOp(spv::OpShiftRightLogical, u32, value, b.makeUintConstant(shift_right)) : value;
+        v = b.createBinOp(spv::OpBitwiseAnd, u32, v, b.makeUintConstant(1));
+        return shift_left ? b.createBinOp(spv::OpShiftLeftLogical, u32, v, b.makeUintConstant(shift_left)) : v;
+    };
+    const spv::Id x = pixel(0);
+    const spv::Id y = pixel(1);
+    const spv::Id a = b.createBinOp(spv::OpBitwiseXor, u32, x, y);
+    // bit reversed interleave of (x ^ y, y): the classic 4x4 Bayer matrix 0 8 2 10 / 12 4 14 6 / 3 11 1 9 / 15 7 13 5
+    spv::Id index = bit(a, 0, 3);
+    index = b.createBinOp(spv::OpBitwiseOr, u32, index, bit(y, 0, 2));
+    index = b.createBinOp(spv::OpBitwiseOr, u32, index, bit(a, 1, 1));
+    index = b.createBinOp(spv::OpBitwiseOr, u32, index, bit(y, 1, 0));
+    spv::Id noise = b.createUnaryOp(spv::OpConvertUToF, f32, index);
+    noise = b.createBinOp(spv::OpFAdd, f32, noise, b.makeFloatConstant(0.5f));
+    noise = b.createBinOp(spv::OpFMul, f32, noise, b.makeFloatConstant(1.0f / 16.0f));
+    noise = b.createBinOp(spv::OpFSub, f32, noise, b.makeFloatConstant(0.5f));
+    const spv::Id enabled_ptr = utils::create_access_chain(b, spv::StorageClassUniform, state.render_info_id, { b.makeIntConstant(FRAG_UNIFORM_dither_enabled) });
+    noise = b.createBinOp(spv::OpFMul, f32, noise, b.createLoad(enabled_ptr, spv::NoPrecision));
+    const spv::Id noise4 = b.createCompositeConstruct(v4, { noise, noise, noise, noise });
+    const spv::Id amp4 = b.makeCompositeConstant(v4, { b.makeFloatConstant(amp[0]), b.makeFloatConstant(amp[1]), b.makeFloatConstant(amp[2]), b.makeFloatConstant(amp[3]) });
+    return b.createBinOp(spv::OpFAdd, v4, color, b.createBinOp(spv::OpFMul, v4, noise4, amp4));
 }
 
 static spv::Id alpha_surface_to_shader_color(spv::Builder &b, const spv::Id color) {
@@ -827,10 +880,15 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
             }
 
             if (query_info.coord_index == 10) {
-                coords[query_info.coord_index].first = b.createVariable(spv::NoPrecision, spv::StorageClassInput,
+                const spv::Id point_coord_in = b.createVariable(spv::NoPrecision, spv::StorageClassInput,
                     b.makeVectorType(b.makeFloatType(32), 2), coord_name.c_str());
-                b.addDecoration(coords[query_info.coord_index].first, spv::DecorationBuiltIn, spv::BuiltInPointCoord);
-                translation_state.interfaces.push_back(coords[query_info.coord_index].first);
+                b.addDecoration(point_coord_in, spv::DecorationBuiltIn, spv::BuiltInPointCoord);
+                translation_state.interfaces.push_back(point_coord_in);
+                translation_state.point_coord_input_id = point_coord_in;
+                // the textures read the flipped copy, written by frag_init
+                coords[query_info.coord_index].first = b.createVariable(spv::NoPrecision, spv::StorageClassPrivate,
+                    b.makeVectorType(b.makeFloatType(32), 2), "v_PointCoord");
+                translation_state.point_coord_private_id = coords[query_info.coord_index].first;
             } else {
                 coords[query_info.coord_index].first = create_fragment_iterator(b, translation_state, spv::NoPrecision,
                     b.makeVectorType(b.makeFloatType(32), 4), coord_name.c_str(), TEXCOORD_BASE_LOCATION + query_info.coord_index);
@@ -898,7 +956,17 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
             // The GPU supports gl_LastFragData.
             // On Vulkan this is a subpass input, it is similar to gl_LastFragData (and should have the same speed on integrated GPUs)
             // This is not supported on OpenGL with SpirV
-            const spv::Id image_type = b.makeImageType(f32, spv::DimSubpassData, false, false, false, 2, spv::ImageFormatUnknown);
+            // B140: a multisampled colour attachment is read per sample (SampleId turns the shader into a per-sample one)
+            const bool ms_input = translation_state.is_vulkan && translation_state.hints->ms_color_input;
+            spv::Id sample_id = spv::NoResult;
+            if (ms_input) {
+                b.addCapability(spv::CapabilitySampleRateShading);
+                sample_id = b.createVariable(spv::NoPrecision, spv::StorageClassInput, b.makeIntType(32), "gl_SampleID");
+                b.addDecoration(sample_id, spv::DecorationBuiltIn, spv::BuiltInSampleId);
+                translation_state.interfaces.push_back(sample_id);
+                sample_id = b.createLoad(sample_id, spv::NoPrecision);
+            }
+            const spv::Id image_type = b.makeImageType(f32, spv::DimSubpassData, false, false, ms_input, 2, spv::ImageFormatUnknown);
             const spv::Id last_frag_data = b.createVariable(precision, spv::StorageClassUniformConstant, image_type, "last_frag_data");
             b.addDecoration(last_frag_data, spv::DecorationInputAttachmentIndex, 0);
             if (translation_state.is_vulkan) {
@@ -910,9 +978,16 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
             spv::Id coord_0 = b.makeIntConstant(0);
             const spv::Id ivec2 = b.makeVectorType(b.makeIntType(32), 2);
             coord_0 = b.makeCompositeConstant(ivec2, { coord_0, coord_0 });
+            const auto read_subpass = [&](spv::Id result_type, spv::Id image_var) {
+                if (!ms_input)
+                    return b.createOp(spv::OpImageRead, result_type, { b.createLoad(image_var, spv::NoPrecision), coord_0 });
+                const std::vector<spv::IdImmediate> operands = { { true, b.createLoad(image_var, spv::NoPrecision) }, { true, coord_0 },
+                    { false, spv::ImageOperandsSampleMask }, { true, sample_id } };
+                return b.createOp(spv::OpImageRead, result_type, operands);
+            };
             if (translation_state.is_vulkan && translation_state.hints->raw_color_attachment_input) {
                 const spv::Id raw_component_type = b.makeUintType(32);
-                const spv::Id raw_image_type = b.makeImageType(raw_component_type, spv::DimSubpassData, false, false, false, 2, spv::ImageFormatUnknown);
+                const spv::Id raw_image_type = b.makeImageType(raw_component_type, spv::DimSubpassData, false, false, ms_input, 2, spv::ImageFormatUnknown);
                 const spv::Id last_frag_data_raw = b.createVariable(spv::NoPrecision, spv::StorageClassUniformConstant, raw_image_type, "last_frag_data_rawUI");
                 b.addDecoration(last_frag_data_raw, spv::DecorationInputAttachmentIndex, 1);
                 b.addDecoration(last_frag_data_raw, spv::DecorationBinding, 2);
@@ -922,19 +997,19 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
                 const spv::Id read_float_input = b.createBinOp(spv::OpFOrdLessThan, b.makeBoolType(), b.createLoad(use_raw_ptr, spv::NoPrecision), b.makeFloatConstant(0.5f));
                 spv::Builder::If raw_cond_builder(read_float_input, spv::SelectionControlMaskNone, b);
 
-                source = b.createOp(spv::OpImageRead, v4, { b.createLoad(last_frag_data, spv::NoPrecision), coord_0 });
+                source = read_subpass(v4, last_frag_data);
                 b.setPrecision(source, precision);
                 store_source_result();
 
                 raw_cond_builder.makeBeginElse();
-                source = b.createOp(spv::OpImageRead, b.makeVectorType(raw_component_type, 4), { b.createLoad(last_frag_data_raw, spv::NoPrecision), coord_0 });
+                source = read_subpass(b.makeVectorType(raw_component_type, 4), last_frag_data_raw);
                 target_to_store.type = DataType::UINT16;
                 store_source_result(true);
                 raw_cond_builder.makeEndIf();
 
                 source = spv::NoResult;
             } else {
-                source = b.createOp(spv::OpImageRead, v4, { b.createLoad(last_frag_data, spv::NoPrecision), coord_0 });
+                source = read_subpass(v4, last_frag_data);
                 b.setPrecision(source, precision);
             }
 
@@ -1097,6 +1172,7 @@ static void copy_uniform_block_to_register(spv::Builder &builder, spv::Id sa_ban
 static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProgram &program, utils::SpirvUtilFunctions &utils,
     const FeatureState &features, TranslationState &translation_state, SceGxmProgramType program_type, NonDependentTextureQueryCallInfos &texture_queries) {
     SpirvShaderParameters spv_params = {};
+    spv_params.buffer_stores_supported = program_type == SceGxmProgramType::Vertex ? features.support_vertex_stores : features.support_fragment_stores;
     const SceGxmProgramParameter *const gxp_parameters = program.program_parameters();
 
     // Make array type. TODO: Make length configurable
@@ -1189,7 +1265,7 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
             is_vert ? "vertexData" : "fragmentData");
 
         b.addDecoration(spv_params.buffer_container, spv::DecorationRestrict);
-        b.addDecoration(spv_params.buffer_container, spv::DecorationNonWritable);
+        // NonWritable is added after the program is translated, and only when it contains no store into the container (set where the shader body is generated)
         const int ssbo_binding = (is_vert ? 0 : 1) + (translation_state.is_vulkan ? 2 : 0);
         b.addDecoration(spv_params.buffer_container, spv::DecorationBinding, ssbo_binding);
         if (translation_state.is_vulkan)
@@ -1230,7 +1306,7 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
 
     if (program_type == SceGxmProgramType::Vertex) {
         // Create the default reg uniform buffer
-        std::vector<spv::Id> uniform_composition = { v4, f32, f32, f32, f32, f32 };
+        std::vector<spv::Id> uniform_composition = { v4, f32, f32, f32, f32, f32, f32 };
         if (uniform_buffer_count > 0)
             uniform_composition.push_back(buffer_addresses_type);
         if (uniform_texture_count > 0) {
@@ -1254,6 +1330,7 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
         ADD_VERT_UNIFORM_MEMBER(screen_height);
         ADD_VERT_UNIFORM_MEMBER(z_offset);
         ADD_VERT_UNIFORM_MEMBER(z_scale);
+        ADD_VERT_UNIFORM_MEMBER(point_size);
 
 #undef ADD_VERT_UNIFORM_MEMBER
 #define ADD_EXT_UNIFORM_MEMBER(name)                                                                                                                                                \
@@ -1279,7 +1356,7 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
     }
 
     if (program_type == SceGxmProgramType::Fragment) {
-        std::vector<spv::Id> uniform_composition = { f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32 };
+        std::vector<spv::Id> uniform_composition = { f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32 };
         if (uniform_buffer_count > 0)
             uniform_composition.push_back(buffer_addresses_type);
         if (uniform_texture_count > 0) {
@@ -1309,6 +1386,9 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
         ADD_FRAG_UNIFORM_MEMBER(inv_frag_height);
         ADD_FRAG_UNIFORM_MEMBER(raw_cast_mask);
         ADD_FRAG_UNIFORM_MEMBER(iterator_written_mask);
+        ADD_FRAG_UNIFORM_MEMBER(dither_enabled);
+        ADD_FRAG_UNIFORM_MEMBER(point_flip_u);
+        ADD_FRAG_UNIFORM_MEMBER(point_flip_v);
 
 #undef ADD_FRAG_UNIFORM_MEMBER
         // the resolution multiplier does not require a high precision
@@ -1743,6 +1823,8 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
     if (is_u8_alpha_color_surface(translate_state))
         color = shader_color_to_alpha_surface(b, color);
 
+    color = apply_surface_dither(b, translate_state, color);
+
     if (program.is_frag_color_used() && features.should_use_shader_interlock()) {
         spv::Id signed_i32 = b.makeIntType(32);
         spv::Id coord_id = b.createLoad(translate_state.frag_coord_id, spv::NoPrecision);
@@ -2096,6 +2178,15 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
         }
     }
 
+    // A program without PSIZE gets the size of the point width register (a Vulkan point of unwritten size is undefined)
+    if (translation_state.is_vulkan && !(vertex_outputs & SCE_GXM_VERTEX_PROGRAM_OUTPUT_PSIZE)) {
+        const spv::Id point_size_var = b.createVariable(spv::NoPrecision, spv::StorageClassOutput, b.makeFloatType(32), "gl_PointSize");
+        b.addDecoration(point_size_var, spv::DecorationBuiltIn, spv::BuiltInPointSize);
+        translation_state.interfaces.push_back(point_size_var);
+        const spv::Id size_ptr = utils::create_access_chain(b, spv::StorageClassUniform, translation_state.render_info_id, { b.makeIntConstant(VERT_UNIFORM_point_size) });
+        b.createStore(b.createLoad(size_ptr, spv::NoPrecision), point_size_var);
+    }
+
     b.makeReturn(false);
     b.setBuildPoint(last_build_point);
 
@@ -2138,6 +2229,21 @@ static spv::Function *make_frag_initialize_function(spv::Builder &b, Translation
     spv::Builder::If back_disabled_cond_builder(pred, spv::SelectionControlMaskNone, b);
     b.makeStatementTerminator(spv::OpKill, "kill");
     back_disabled_cond_builder.makeEndIf();
+
+    if (translate_state.point_coord_input_id != spv::NoResult && translate_state.point_coord_private_id != spv::NoResult) {
+        // x' = x + flip * (1 - 2x) per axis: PROVISIONAL point sprite coordinate modes of the polygon mode (raster_model.h)
+        const spv::Id f32 = b.makeFloatType(32);
+        const spv::Id v2 = b.makeVectorType(f32, 2);
+        const spv::Id point_coord = b.createLoad(translate_state.point_coord_input_id, spv::NoPrecision);
+        const spv::Id flip_u = b.createLoad(utils::create_access_chain(b, spv::StorageClassUniform, translate_state.render_info_id, { b.makeIntConstant(FRAG_UNIFORM_point_flip_u) }), spv::NoPrecision);
+        const spv::Id flip_v = b.createLoad(utils::create_access_chain(b, spv::StorageClassUniform, translate_state.render_info_id, { b.makeIntConstant(FRAG_UNIFORM_point_flip_v) }), spv::NoPrecision);
+        const auto flipped = [&](const unsigned comp, const spv::Id flip) {
+            const spv::Id x = b.createCompositeExtract(point_coord, f32, comp);
+            const spv::Id one_minus_2x = b.createBinOp(spv::OpFSub, f32, b.makeFloatConstant(1.0f), b.createBinOp(spv::OpFMul, f32, x, b.makeFloatConstant(2.0f)));
+            return b.createBinOp(spv::OpFAdd, f32, x, b.createBinOp(spv::OpFMul, f32, flip, one_minus_2x));
+        };
+        b.createStore(b.createCompositeConstruct(v2, { flipped(0, flip_u), flipped(1, flip_v) }), translate_state.point_coord_private_id);
+    }
 
     b.makeReturn(false);
     b.setBuildPoint(last_build_point);
@@ -2364,6 +2470,11 @@ static SpirvCode convert_gxp_to_spirv_impl(const SceGxmProgram &program, const s
         }
 
         generate_shader_body(b, parameters, program, features, utils, begin_hook_func, end_hook_func, texture_queries, translation_state.render_info_id, spv_func_main, translation_state.interfaces, translation_state.usse_stats);
+        translation_state.usse_stats.buffer_store_count = utils.buffer_store_count;
+        // A shader that writes the container must not declare it NonWritable (see UsseTranslationStats::buffer_store_count). The read-only
+        // declaration stays for every other shader so the driver can keep treating it as a constant buffer.
+        if (parameters.buffer_container && utils.buffer_store_count == 0)
+            b.addDecoration(parameters.buffer_container, spv::DecorationNonWritable);
     } else {
         generate_update_mask_body(b, translation_state);
     }

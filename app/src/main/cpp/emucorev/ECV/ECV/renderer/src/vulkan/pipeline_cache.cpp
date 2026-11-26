@@ -16,6 +16,10 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <renderer/vulkan/pipeline_cache.h>
+
+#include <cstring>
+#include <renderer/vulkan/buffer_store_model.h>
+#include <renderer/vulkan/pipeline_cache_file.h>
 #include <renderer/vulkan/render_pass_sync.h>
 
 #include <renderer/functions.h>
@@ -44,6 +48,13 @@
 #include <unordered_map>
 
 #include <SDL3/SDL_cpuinfo.h>
+
+#if defined(__ANDROID__) || defined(__linux__)
+#include <dlfcn.h>
+#include <elf.h>
+#include <link.h>
+#include <sys/stat.h>
+#endif
 
 // don't use the dispatch version, because we always hash a small amount
 // with a known size
@@ -79,6 +90,8 @@ struct CompileRequest {
     shader::Hints hints;
     PipelineDsInfo ds;
     dsmodel::PassVariant variant;
+    // sample count of the render pass the pipeline is built for (B140)
+    vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1;
 
     // Compilation also reads color_surface beyond the hashed fixed-state prefix.
     // Own the full value while the rendering thread advances its live record.
@@ -324,64 +337,137 @@ void PipelineCache::set_async_compilation(bool enable) {
 }
 
 // magic number put at the beginning of the pipeline cache file
-constexpr uint32_t pipeline_cache_magic = 0xBEEF4321;
+// Identity of the running build: the ELF build id of the module that contains this code (changes with every relink), else a stamp of its file.
+static uint64_t current_binary_id() {
+#if defined(__ANDROID__) || defined(__linux__)
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<const void *>(&current_binary_id), &info) && info.dli_fbase) {
+        struct Ctx {
+            const void *base;
+            uint64_t id;
+        } ctx{ info.dli_fbase, 0 };
+        dl_iterate_phdr([](dl_phdr_info *module, size_t, void *data) -> int {
+            auto *c = static_cast<Ctx *>(data);
+            for (int i = 0; i < module->dlpi_phnum; i++) {
+                const ElfW(Phdr) &ph = module->dlpi_phdr[i];
+                if (ph.p_type != PT_LOAD)
+                    continue;
+                const auto start = module->dlpi_addr + ph.p_vaddr;
+                if (reinterpret_cast<uintptr_t>(c->base) < start || reinterpret_cast<uintptr_t>(c->base) >= start + ph.p_memsz)
+                    continue;
+                // this module: look for the GNU build id note
+                for (int j = 0; j < module->dlpi_phnum; j++) {
+                    const ElfW(Phdr) &note_ph = module->dlpi_phdr[j];
+                    if (note_ph.p_type != PT_NOTE)
+                        continue;
+                    const uint8_t *p = reinterpret_cast<const uint8_t *>(module->dlpi_addr + note_ph.p_vaddr);
+                    const uint8_t *end = p + note_ph.p_memsz;
+                    while (p + sizeof(ElfW(Nhdr)) <= end) {
+                        const auto *nh = reinterpret_cast<const ElfW(Nhdr) *>(p);
+                        const uint8_t *name = p + sizeof(ElfW(Nhdr));
+                        const uint8_t *desc = name + ((nh->n_namesz + 3) & ~3u);
+                        if (nh->n_type == NT_GNU_BUILD_ID && desc + nh->n_descsz <= end) {
+                            c->id = XXH3_64bits(desc, nh->n_descsz);
+                            return 1;
+                        }
+                        p = desc + ((nh->n_descsz + 3) & ~3u);
+                    }
+                }
+                return 1;
+            }
+            return 0;
+        }, &ctx);
+        if (ctx.id)
+            return ctx.id;
+        // no build id note: stamp of the library file
+        if (info.dli_fname) {
+            struct stat st{};
+            if (stat(info.dli_fname, &st) == 0) {
+                const uint64_t parts[2] = { static_cast<uint64_t>(st.st_size), static_cast<uint64_t>(st.st_mtime) };
+                return XXH3_64bits(parts, sizeof(parts));
+            }
+        }
+    }
+#endif
+    // host builds (replay): the compile time of this file
+    static const char stamp[] = __DATE__ " " __TIME__;
+    return XXH3_64bits(stamp, sizeof(stamp));
+}
+
+static renderer::vulkan::PipelineCacheIdentity pipeline_cache_identity(const vk::PhysicalDeviceProperties &props) {
+    renderer::vulkan::PipelineCacheIdentity id;
+    id.binary_id = current_binary_id();
+    id.translator_version = static_cast<uint32_t>(shader::CURRENT_VERSION);
+    id.driver_version = props.driverVersion;
+    id.api_version = props.apiVersion;
+    id.vendor_id = props.vendorID;
+    id.device_id = props.deviceID;
+    for (size_t i = 0; i < id.uuid.size(); i++)
+        id.uuid[i] = props.pipelineCacheUUID[i];
+    return id;
+}
+
+static fs::path pipeline_cache_path(const VKState &state) {
+    return state.shaders_path / fmt::format("pipeline-cache-vk{}.dat", shader::CURRENT_VERSION);
+}
 
 void PipelineCache::read_pipeline_cache() {
-    const std::string pipeline_cache_name = fmt::format("pipeline-cache-vk{}.dat", shader::CURRENT_VERSION);
-    const fs::path path = state.shaders_path / pipeline_cache_name;
+    using namespace renderer::vulkan;
+    const fs::path path = pipeline_cache_path(state);
 
-    fs::ifstream pipeline_cache_file(path, std::ios::in | std::ios::binary);
-    if (!pipeline_cache_file.is_open())
+    fs::ifstream file(path, std::ios::in | std::ios::binary);
+    if (!file.is_open())
         return;
 
-    LOG_INFO("Found pipeline cache, reading...");
+    file.seekg(0, fs::ifstream::end);
+    const uint64_t file_size = static_cast<uint64_t>(file.tellg());
+    file.seekg(0);
 
-    pipeline_cache_file.seekg(0, fs::ifstream::end);
-    size_t pipeline_size = pipeline_cache_file.tellg();
-    pipeline_cache_file.seekg(0);
-
-    if (pipeline_size < sizeof(uint32_t) + sizeof(size_t))
-        return;
-
-    // read the hashes
-    auto read_integer = [&]<typename T>(T &val) {
-        pipeline_cache_file.read(reinterpret_cast<char *>(&val), sizeof(T));
+    // Never hand an unvalidated blob to the driver (B148: another build's blob crashed vkCreateGraphicsPipelines on Adreno at startup).
+    auto discard = [&](CacheReject reason) {
+        // lab-checkable: grep "pipeline cache: discarded"
+        LOG_WARN("pipeline cache: discarded ({})", to_string(reason));
+        file.close();
+        boost::system::error_code ignored;
+        fs::remove(path, ignored); // rewritten with the right identity at the next save
     };
-    uint32_t magic_number;
-    read_integer(magic_number);
-    size_t nb_hashes;
-    read_integer(nb_hashes);
-    // safety check
-    size_t hashes_size = sizeof(magic_number) + sizeof(nb_hashes) + nb_hashes * sizeof(uint64_t);
-    if (magic_number != pipeline_cache_magic || pipeline_size < hashes_size) {
-        LOG_WARN("Pipeline cache is corrupted, ignoring it.");
-        pipeline_cache_file.close();
+
+    PipelineCacheFileHeader header;
+    if (file_size < sizeof(header)) {
+        discard(CacheReject::TooSmall);
         return;
     }
-    pipeline_size -= hashes_size;
-
-    // insert hashes with null pipeline
-    for (size_t i = 0; i < nb_hashes; i++) {
-        uint64_t hash;
-        read_integer(hash);
-        pipelines[hash] = nullptr;
+    file.read(reinterpret_cast<char *>(&header), sizeof(header));
+    const CacheReject reject = validate_header(header, pipeline_cache_identity(state.physical_device_properties), file_size);
+    if (reject != CacheReject::None) {
+        discard(reject);
+        return;
     }
 
-    std::vector<char> pipeline_data(pipeline_size);
-    pipeline_cache_file.read(pipeline_data.data(), pipeline_size);
-    pipeline_cache_file.close();
+    std::vector<uint64_t> keys(header.pipeline_count);
+    file.read(reinterpret_cast<char *>(keys.data()), static_cast<std::streamsize>(keys.size() * sizeof(uint64_t)));
+    std::vector<char> blob(header.blob_size);
+    file.read(blob.data(), static_cast<std::streamsize>(blob.size()));
+    if (!file || XXH3_64bits(blob.data(), blob.size()) != header.blob_hash) {
+        discard(file ? CacheReject::Corrupt : CacheReject::Truncated);
+        return;
+    }
+    file.close();
 
     vk::PipelineCacheCreateInfo cache_info{
-        .initialDataSize = pipeline_size,
-        .pInitialData = pipeline_data.data()
+        .initialDataSize = blob.size(),
+        .pInitialData = blob.data()
     };
-
     state.device.destroyPipelineCache(pipeline_cache);
     pipeline_cache = state.device.createPipelineCache(cache_info);
-    LOG_INFO("Pipeline cache read and loaded");
+    // only now are the keys trusted: they describe pipelines this cache can serve quickly
+    for (const uint64_t key : keys)
+        pipelines[key] = nullptr;
+    LOG_WARN("pipeline cache: loaded ({} pipelines, {} bytes)", keys.size(), blob.size()); // WARN: the lab log level hides INFO
 }
 
 void PipelineCache::save_pipeline_cache() {
+    using namespace renderer::vulkan;
     // first save the shader hashes
     // do a copy for thread safety
     std::vector<ShadersHash> shader_cache_copy;
@@ -396,29 +482,39 @@ void PipelineCache::save_pipeline_cache() {
         // No pipeline was created
         return;
 
-    const std::string pipeline_cache_name = fmt::format("pipeline-cache-vk{}.dat", shader::CURRENT_VERSION);
-    const fs::path path = state.shaders_path / pipeline_cache_name;
-
-    fs::ofstream pipeline_cache_file(path, std::ios::out | std::ios::binary | std::ios::trunc);
-    if (!pipeline_cache_file.is_open())
+    const fs::path path = pipeline_cache_path(state);
+    // write next to the real file and rename, a crash or a full disk can no longer leave a truncated cache
+    const fs::path tmp_path = fs::path(path.string() + ".tmp");
+    fs::ofstream file(tmp_path, std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!file.is_open())
         return;
 
     LOG_INFO("Saving pipeline cache...");
 
-    // first save the hashes of all pipelines
-    auto write_integer = [&]<typename T>(T val) {
-        pipeline_cache_file.write(reinterpret_cast<const char *>(&val), sizeof(T));
-    };
-    write_integer(pipeline_cache_magic);
-    write_integer(pipelines.size());
+    const PipelineCacheFileHeader header = make_header(pipeline_cache_identity(state.physical_device_properties), pipeline_data.size(),
+        XXH3_64bits(pipeline_data.data(), pipeline_data.size()), pipelines.size());
+    file.write(reinterpret_cast<const char *>(&header), sizeof(header));
     for (auto &[hash, _] : pipelines) {
-        write_integer(hash);
+        const uint64_t key = hash;
+        file.write(reinterpret_cast<const char *>(&key), sizeof(key));
     }
-
-    // then save the cache
-    pipeline_cache_file.write(reinterpret_cast<const char *>(pipeline_data.data()), pipeline_data.size());
-    pipeline_cache_file.close();
-    LOG_INFO("Pipeline cache saved");
+    file.write(reinterpret_cast<const char *>(pipeline_data.data()), static_cast<std::streamsize>(pipeline_data.size()));
+    file.close();
+    if (!file.good()) {
+        LOG_WARN("Could not write the pipeline cache, keeping the previous one.");
+        boost::system::error_code ignored;
+        fs::remove(tmp_path, ignored);
+        return;
+    }
+    boost::system::error_code rename_ec;
+    fs::rename(tmp_path, path, rename_ec);
+    if (rename_ec) {
+        LOG_WARN("Could not replace the pipeline cache: {}", rename_ec.message());
+        return;
+    }
+    LOG_WARN("pipeline cache: saved ({} pipelines)", pipelines.size());
+    last_saved_pipeline_count = pipelines.size();
+    last_save_time_s = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
 void PipelineCache::cleanup() {
@@ -571,6 +667,7 @@ vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmPro
                 };
 
                 module = state.device.createShaderModule(shader_info);
+                note_module_stores(module, source.data(), source.size());
 
                 std::lock_guard<std::mutex> guard(shaders_mutex);
                 // Save shader cache hashes
@@ -608,8 +705,9 @@ vk::RenderPass PipelineCache::retrieve_render_pass(vk::Format format, bool depth
     const uint64_t pass_key = (static_cast<uint64_t>(format) << 32) | static_cast<uint64_t>(ds_format);
     const bool with_raw_attachment = has_raw_attachment && !no_color && !is_color_transient && state.features.preserve_f16_nan_as_u16 && format == vk::Format::eR16G16B16A16Sfloat;
     bool shell_snapshot = false;
-    shell_snapshot = state.current_title_id == "SceShell" && !no_color && !is_color_transient
-        && !with_raw_attachment && format == vk::Format::eR8G8B8A8Unorm;
+    // the SceShell glow always reads a snapshot (PAF samples completed pixels); the copy-snapshot fbfetch rung does it for every title and format
+    shell_snapshot = !no_color && !is_color_transient && !with_raw_attachment
+        && (state.use_copy_snapshot || (state.current_title_id == "SceShell" && format == vk::Format::eR8G8B8A8Unorm));
 
     auto &render_passes_map = no_color
         ? shader_interlock_pass
@@ -865,7 +963,7 @@ void PipelineCache::compiler_thread(MemState &mem) {
             // use this as an instruction to stop the thread
             break;
 
-        vk::Pipeline pipeline = compile_pipeline(request->type, request->render_pass, *request->vertex_program_gxm, *request->fragment_program_gxm, request->vertex_source, request->fragment_source, *request->get_record(), request->hints, mem, request->ds, request->variant);
+        vk::Pipeline pipeline = compile_pipeline(request->type, request->render_pass, *request->vertex_program_gxm, *request->fragment_program_gxm, request->vertex_source, request->fragment_source, *request->get_record(), request->hints, mem, request->ds, request->variant, request->samples);
         // mark a refused pipeline as failed rather than leaving it null, which would make every
         // later draw queue the same doomed compilation again
         *request->pipeline = pipeline ? pipeline : kPipelineFailed;
@@ -892,7 +990,16 @@ static vk::StencilOpState convert_op_state(const GxmStencilStateOp &state) {
     };
 }
 
-vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::RenderPass render_pass, const SceGxmVertexProgram &vertex_program_gxm, const SceGxmFragmentProgram &fragment_program_gxm, const ProgramSource &vertex_source, const ProgramSource &fragment_source, const GxmRecordState &record, const shader::Hints &hints, MemState &mem, const PipelineDsInfo &ds, dsmodel::PassVariant variant) {
+vk::CullModeFlags PipelineCache::draw_cull_mode(SceGxmCullMode guest, dsmodel::PassVariant variant) {
+    vk::CullModeFlags cull_mode = translate_cull_mode(guest);
+    if (variant == dsmodel::PassVariant::SplitFront)
+        cull_mode |= vk::CullModeFlagBits::eBack;
+    else if (variant == dsmodel::PassVariant::SplitBack)
+        cull_mode |= vk::CullModeFlagBits::eFront;
+    return cull_mode;
+}
+
+vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::RenderPass render_pass, const SceGxmVertexProgram &vertex_program_gxm, const SceGxmFragmentProgram &fragment_program_gxm, const ProgramSource &vertex_source, const ProgramSource &fragment_source, const GxmRecordState &record, const shader::Hints &hints, MemState &mem, const PipelineDsInfo &ds, dsmodel::PassVariant variant, vk::SampleCountFlagBits samples) {
     const VertexProgram &vertex_program = *vertex_program_gxm.renderer_data;
     const SceGxmProgram *gxm_fragment_shader = fragment_source.get();
     const VKFragmentProgram &fragment_program = *reinterpret_cast<VKFragmentProgram *>(
@@ -909,6 +1016,9 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
     // draw() computes this from the paired GXP before queuing a pipeline.
     // Include it in both shader cache identities so async and disk caches agree.
     fragment_hints.vertex_output_mask = vertex_program.varying_location_mask;
+    // B140: a fetching shader of a multisampled scene reads its (multisampled) input attachment at gl_SampleID
+    const bool multisampled = samples != vk::SampleCountFlagBits::e1;
+    fragment_hints.ms_color_input = multisampled && state.features.direct_fragcolor && gxm_fragment_shader->is_frag_color_used();
 
     const vk::PipelineShaderStageCreateInfo vertex_shader = retrieve_shader(vertex_source.get(), vertex_program.hash, true, fragment_program_gxm.is_maskupdate, mem, hints);
     const vk::PipelineShaderStageCreateInfo fragment_shader = retrieve_shader(gxm_fragment_shader, fragment_program.hash, false, fragment_program_gxm.is_maskupdate, mem, fragment_hints, record.is_gamma_corrected);
@@ -933,16 +1043,19 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
 
     SceGxmPolygonMode face_polygon_mode = back_state ? record.back_polygon_mode : record.front_polygon_mode;
     vk::PolygonMode polygon_mode = translate_polygon_mode(face_polygon_mode);
-    if (polygon_mode != vk::PolygonMode::eFill && !state.physical_device_features.fillModeNonSolid) {
+    if (polygon_mode != vk::PolygonMode::eFill && !state.gpu_caps.fill_mode_non_solid) {
         // line/point rasterisation needs fillModeNonSolid (enabled whenever the device has it)
         LOG_WARN_ONCE("Polygon mode line/point requested but the device has no fillModeNonSolid: drawing filled");
         polygon_mode = vk::PolygonMode::eFill;
     }
-    vk::CullModeFlags cull_mode = translate_cull_mode(record.cull_mode);
-    if (variant == dsmodel::PassVariant::SplitFront)
-        cull_mode |= vk::CullModeFlagBits::eBack;
-    else if (variant == dsmodel::PassVariant::SplitBack)
-        cull_mode |= vk::CullModeFlagBits::eFront;
+    if (type == SCE_GXM_PRIMITIVE_TRIANGLE_EDGES) {
+        if (state.gpu_caps.fill_mode_non_solid)
+            polygon_mode = vk::PolygonMode::eLine;
+        else
+            LOG_WARN_ONCE("SCE_GXM_PRIMITIVE_TRIANGLE_EDGES needs fillModeNonSolid, which the device lacks: drawing filled triangles");
+    }
+    // with extended dynamic state the cull mode is set per draw (draw_cull_mode), the pipeline does not carry it
+    const vk::CullModeFlags cull_mode = state.use_extended_dynamic_state ? vk::CullModeFlags() : draw_cull_mode(record.cull_mode, variant);
 
     const vk::PipelineRasterizationStateCreateInfo rasterizer{
         .depthClampEnable = (enable_depth_clamp && state.depth_clamp_enabled && state.physical_device_features.depthClamp) ? VK_TRUE : VK_FALSE,
@@ -953,8 +1066,11 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
         .depthBiasEnable = VK_TRUE,
         .lineWidth = 1.0f
     };
+    // a fetching shader of a multisampled scene runs once per sample (it reads the multisampled input attachment at gl_SampleID)
     const vk::PipelineMultisampleStateCreateInfo multisampling{
-        .rasterizationSamples = vk::SampleCountFlagBits::e1
+        .rasterizationSamples = samples,
+        .sampleShadingEnable = fragment_hints.ms_color_input ? VK_TRUE : VK_FALSE,
+        .minSampleShading = fragment_hints.ms_color_input ? 1.0f : 0.0f
     };
     // depth and stencil tests are always enabled on the ps vita as there is almost no cost in doing so
     // on a tiled renderer. The tests are only off when the host format has no such aspect (device without a stencil format).
@@ -991,6 +1107,12 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
         blend_attachments[0] = fragment_program.blending;
         if (hints.color_format == SCE_GXM_COLOR_FORMAT_U8_A)
             blend_attachments[0] = translate_alpha_surface_blend(blend_attachments[0]);
+        // the host format of this surface cannot blend (probed, P7): the lossless format wins over the blend, see colourmodel
+        const auto colour_entry = state.colour_entry(record.color_base_format);
+        if (colour_entry && !colour_entry->blend_ok && blend_attachments[0].blendEnable) {
+            LOG_WARN_ONCE("Blending on a {} surface is not supported by the device: drawn without blending", vk::to_string(colour_entry->format));
+            blend_attachments[0].blendEnable = VK_FALSE;
+        }
     }
     color_blending.attachmentCount = with_raw_attachment ? 2 : 1;
     color_blending.pAttachments = blend_attachments.data();
@@ -999,19 +1121,20 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
 
     // all of these can be changed at any time using the vita graphics api (like opengl)
     // Because each one can take a lot of different values, it's better to set them as dynamic
-    const std::array dynamic_states = {
+    std::vector<vk::DynamicState> dynamic_states = {
         vk::DynamicState::eViewport,
         vk::DynamicState::eScissor,
         vk::DynamicState::eStencilCompareMask,
         vk::DynamicState::eStencilReference,
         vk::DynamicState::eStencilWriteMask,
         vk::DynamicState::eDepthBias,
-        vk::DynamicState::eLineWidth,
     };
+    if (state.use_extended_dynamic_state)
+        dynamic_states.push_back(vk::DynamicState::eCullModeEXT);
+    if (state.physical_device_features.wideLines)
+        dynamic_states.push_back(vk::DynamicState::eLineWidth);
     vk::PipelineDynamicStateCreateInfo dynamic_info{};
     dynamic_info.setDynamicStates(dynamic_states);
-    if (!state.physical_device_features.wideLines)
-        dynamic_info.dynamicStateCount--;
 
     // we still need to specify the viewport and scissor count even though they are dynamic
     vk::PipelineViewportStateCreateInfo viewport{
@@ -1035,6 +1158,25 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
         .subpass = 0
     };
 
+    // RenderPath::DynamicRendering: no VkRenderPass, the attachment formats go through VkPipelineRenderingCreateInfo (same formats the
+    // render pass objects would have been created with: retrieve_render_pass)
+    vk::PipelineRenderingCreateInfo rendering_info{};
+    std::array<vk::Format, 2> rendering_color_formats{};
+    if (state.use_dynamic_rendering) {
+        vk::Format color_format = color::translate_surface_format(record.color_base_format);
+        if (record.is_gamma_corrected && color_format == vk::Format::eR8G8B8A8Unorm)
+            color_format = vk::Format::eR8G8B8A8Srgb;
+        rendering_color_formats = { color_format, vk::Format::eR16G16B16A16Uint };
+        rendering_info.colorAttachmentCount = with_raw_attachment ? 2 : 1;
+        rendering_info.pColorAttachmentFormats = rendering_color_formats.data();
+        // the depth/stencil host format of this pipeline (P5: PipelineDsInfo::format instead of state.deep_stencil_use)
+        const vk::Format ds_format = ds.format;
+        rendering_info.depthAttachmentFormat = vkutil::format_has_depth(ds_format) ? ds_format : vk::Format::eUndefined;
+        rendering_info.stencilAttachmentFormat = vkutil::format_has_stencil(ds_format) ? ds_format : vk::Format::eUndefined;
+        pipeline_info.pNext = &rendering_info;
+        pipeline_info.renderPass = nullptr;
+    }
+
     // vulkan.hpp THROWS on an error result here, so a driver refusing the pipeline used to take
     // the whole emulator down before the check below could run. Some drivers (notably Mesa/Turnip)
     // also report an internal shader-compiler rejection as ErrorOutOfHostMemory rather than a
@@ -1046,6 +1188,16 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
             return nullptr;
         }
 
+        if (!state.features.enable_memory_mapping) {
+            uint8_t stages = 0;
+            std::lock_guard<std::mutex> guard(shaders_mutex);
+            if (container_writable_modules.contains(static_cast<VkShaderModule>(vertex_shader.module)))
+                stages |= buffer_store::Vertex;
+            if (!is_fragment_disabled && container_writable_modules.contains(static_cast<VkShaderModule>(fragment_shader.module)))
+                stages |= buffer_store::Fragment;
+            if (stages)
+                pipeline_store_stages[static_cast<VkPipeline>(result.value)] = stages;
+        }
         return result.value;
     } catch (const vk::SystemError &err) {
         LOG_CRITICAL("Failed to create pipeline: {}", err.what());
@@ -1056,27 +1208,55 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
 vk::Pipeline PipelineCache::retrieve_pipeline(VKContext &context, SceGxmPrimitiveType &type, bool consider_for_async, MemState &mem, dsmodel::PassVariant variant) {
     const GxmRecordState &record = context.record;
     // get the hash of the current context
-    uint64_t key = XXH3_64bits(&record, record_pipeline_len);
+    // the pipeline identity: the record up to the vertex streams; with extended dynamic state the cull mode is not part of it (set per draw)
+    static_assert(offsetof(GxmRecordState, cull_mode) + sizeof(GxmRecordState::cull_mode) <= record_pipeline_len, "cull_mode must be inside the hashed prefix");
+    XXH128_hash_t record_hash;
+    if (state.use_extended_dynamic_state) {
+        alignas(GxmRecordState) uint8_t prefix[record_pipeline_len];
+        std::memcpy(prefix, &record, record_pipeline_len);
+        const SceGxmCullMode none = SCE_GXM_CULL_NONE;
+        std::memcpy(prefix + offsetof(GxmRecordState, cull_mode), &none, sizeof(none));
+        record_hash = XXH3_128bits(prefix, record_pipeline_len);
+    } else {
+        record_hash = XXH3_128bits(&record, record_pipeline_len);
+    }
+    uint64_t key = record_hash.low64;
     key = alpha_surface_pipeline_key(key, record.color_surface.colorFormat);
 
-    // add the hash of the blending
+    // the blending, vertex-layout and primitive-type parts are mixed in below with a real hash (P14: they used to be XORed in,
+    // so e.g. two different blending/layout pairs with the same XOR collided onto one pipeline)
     SceGxmFragmentProgram &fragment_program_gxm = *record.fragment_program.get(mem);
     const VKFragmentProgram &fragment_program = *reinterpret_cast<VKFragmentProgram *>(
         fragment_program_gxm.renderer_data.get());
-    key ^= fragment_program.blending_hash;
-
-    // add the hash of the attribute and stream layout
     SceGxmVertexProgram &vertex_program_gxm = *record.vertex_program.get(mem);
-    key ^= vertex_program_gxm.key_hash;
-
-    // and also add the primitive type
-    key ^= static_cast<uint64_t>(type);
+    {
+        const uint64_t parts[4] = { key, fragment_program.blending_hash, vertex_program_gxm.key_hash, static_cast<uint64_t>(type) };
+        key = XXH3_64bits(parts, sizeof(parts));
+        const uint64_t check_parts[5] = { record_hash.high64, parts[1], parts[2], parts[3], static_cast<uint64_t>(record.color_surface.colorFormat) };
+        const uint64_t check = XXH3_64bits_withSeed(check_parts, sizeof(check_parts), 0xC2B2AE3D27D4EB4Full);
+        for (int attempt = 0; attempt < 8; attempt++) {
+            const auto found = pipeline_checks.find(key);
+            if (found == pipeline_checks.end()) {
+                pipeline_checks.emplace(key, check);
+                break;
+            }
+            if (found->second == check)
+                break;
+            // same 64-bit key, different state: never hand out the other state's pipeline
+            LOG_ERROR_ONCE("Pipeline key collision detected, re-keying");
+            key = XXH3_64bits_withSeed(&key, sizeof(key), check);
+        }
+    }
 
     // the render pass is chosen per scene from the depth/stencil surface: its format and which tests exist change the pipeline,
     // and so does the facing variant of a draw split by facing
     const PipelineDsInfo ds_info{ context.ds_host_format, context.ds_depth_test, context.ds_stencil_test };
     key ^= (static_cast<uint64_t>(ds_info.format) * 0x9E3779B97F4A7C15ull) ^ (static_cast<uint64_t>(ds_info.depth_test) << 1) ^ (static_cast<uint64_t>(ds_info.stencil_test) << 2)
         ^ (static_cast<uint64_t>(variant) * 0xC2B2AE3D27D4EB4Full);
+    // B140: the sample count of the render pass the pipeline is used in
+    const vk::SampleCountFlagBits samples = context.ms_scene.active ? context.ms_scene.samples : vk::SampleCountFlagBits::e1;
+    if (samples != vk::SampleCountFlagBits::e1)
+        key ^= 0x9E3779B97F4A7C15ull * static_cast<uint64_t>(samples);
 
     // if the pipeline is in the pipeline cache, we can expect its creation time to be almost instantaneous
     bool already_in_cache = false;
@@ -1132,6 +1312,7 @@ vk::Pipeline PipelineCache::retrieve_pipeline(VKContext &context, SceGxmPrimitiv
             .hints = context.shader_hints,
             .ds = ds_info,
             .variant = variant,
+            .samples = samples,
             .record = record
         };
         it->second = kPipelineCompiling;
@@ -1145,7 +1326,7 @@ vk::Pipeline PipelineCache::retrieve_pipeline(VKContext &context, SceGxmPrimitiv
         return nullptr;
     } else {
         // can't wait, compile it right now
-        vk::Pipeline result = compile_pipeline(type, render_pass, vertex_program_gxm, fragment_program_gxm, vertex_source, fragment_source, record, context.shader_hints, mem, ds_info, variant);
+        vk::Pipeline result = compile_pipeline(type, render_pass, vertex_program_gxm, fragment_program_gxm, vertex_source, fragment_source, record, context.shader_hints, mem, ds_info, variant, samples);
 
         const auto time_s = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         next_pipeline_cache_save = time_s + pipeline_cache_save_delay;
@@ -1181,7 +1362,25 @@ vk::ShaderModule PipelineCache::load_cached_shader_module(const Sha256Hash &hash
         .pCode = source.data()
     };
 
-    return state.device.createShaderModule(shader_info);
+    const vk::ShaderModule module = state.device.createShaderModule(shader_info);
+    note_module_stores(module, source.data(), source.size());
+    return module;
+}
+
+void PipelineCache::note_module_stores(vk::ShaderModule module, const uint32_t *words, size_t count) {
+    // with memory mapping the guest buffers are reached through device addresses and the container does not exist
+    if (state.features.enable_memory_mapping || !module || !buffer_store::spirv_has_writable_storage_buffer(words, count))
+        return;
+    std::lock_guard<std::mutex> guard(shaders_mutex);
+    container_writable_modules.insert(static_cast<VkShaderModule>(module));
+}
+
+uint8_t PipelineCache::pipeline_buffer_stores(vk::Pipeline pipeline) {
+    if (state.features.enable_memory_mapping || !pipeline)
+        return 0;
+    std::lock_guard<std::mutex> guard(shaders_mutex);
+    const auto it = pipeline_store_stages.find(static_cast<VkPipeline>(pipeline));
+    return it == pipeline_store_stages.end() ? 0 : it->second;
 }
 
 vk::ShaderModule PipelineCache::precompile_shader(const Sha256Hash &hash, bool search_first) {

@@ -257,8 +257,6 @@
     <string name="settings_cpu_pool_size">Taille du pool CPU</string>
     <string name="settings_help_cpu_pool_size">Définit le nombre de threads de travail utilisés par l\'émulateur.\n\nUtilisez ce réglage lorsqu’un jeu est lent, saccade ou que l’appareil a de la marge CPU/GPU. Désactivez-le ou réduisez-le en cas de plantages, craquements audio, chauffe, forte consommation ou mauvais timing.</string>
     <string name="settings_cpu_pool_size_value">%1$d threads</string>
-    <string name="settings_hashless_texture_cache">Cache de textures sans hachage</string>
-    <string name="settings_help_hashless_texture_cache">Utilise un mode de cache de textures plus agressif.\n\nUtilisez ce réglage pour réduire les saccades de shaders ou de textures après le premier lancement. Désactivez-le seulement en cas de textures corrompues, écran noir ou plantages reproductibles après la mise en cache.</string>
     <string name="settings_shader_cache">Cache des shaders</string>
     <string name="settings_help_shader_cache">Conserve les shaders compilés entre les sessions pour réduire les saccades.\n\nUtilisez ce réglage pour réduire les saccades de shaders ou de textures après le premier lancement. Désactivez-le seulement en cas de textures corrompues, écran noir ou plantages reproductibles après la mise en cache.</string>
     <string name="settings_pixel_perfect_fullscreen">Plein écran pixel perfect</string>
@@ -1487,6 +1485,9 @@
     <string name="emulation_savestate_loaded_toast">Chargé</string>
     <string name="emulation_savestate_deleted_toast">Supprimé</string>
     <string name="emulation_savestate_failed_toast">Échec de l’opération</string>
+    <string name="emulation_savestate_other_version_toast">Cette sauvegarde d’état a été créée par une autre version de l’application et ne peut pas être chargée. Le fichier a été conservé.</string>
+    <string name="emulation_savestate_other_version_boot_toast">La sauvegarde rapide a été créée par une autre version de l’application et ne peut pas être chargée. Le jeu démarre normalement ; le fichier a été conservé.</string>
+    <string name="emulation_savestate_vulkan_only">Les sauvegardes d’état nécessitent le moteur de rendu Vulkan</string>
     <string name="emulation_savestate_refused_no_game">Aucun jeu n\'est en cours, l\'état ne peut pas être enregistré</string>
     <string name="emulation_savestate_refused_exiting">Le jeu est en train de se fermer, réessayez plus tard</string>
     <string name="emulation_savestate_refused_loading">Le jeu est encore en cours de chargement, réessayez dans un instant</string>

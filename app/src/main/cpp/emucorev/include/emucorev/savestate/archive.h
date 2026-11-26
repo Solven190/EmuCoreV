@@ -46,6 +46,8 @@ enum class SectionId : uint32_t {
     GpuBufferPages = 16,
     Np = 17,
     VideoCodecs = 18,
+    // Optional (absent in engine 20 saves recorded before it existed): per-thread TPIDRURW.
+    ThreadTls = 19,
 };
 
 enum SectionFlags : uint32_t {
@@ -75,6 +77,11 @@ struct Footer {
     uint32_t reserved2 = 0;
 };
 static_assert(sizeof(Footer) == 40);
+
+// "<slot>.bak" keeping: hard link first; when the storage cannot link, copy only files up to this size
+// (provisional, not measured), otherwise skip the backup. The hooks below exist for host tests.
+inline uint64_t backup_copy_limit = 16ull << 20;
+inline bool backup_hard_link_disabled = false;
 
 class Writer {
 public:

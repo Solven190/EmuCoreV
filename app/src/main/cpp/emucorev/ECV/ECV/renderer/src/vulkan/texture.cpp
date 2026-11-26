@@ -23,6 +23,7 @@
 #include <renderer/vulkan/functions.h>
 
 #include <renderer/vulkan/gxm_to_vulkan.h>
+#include <renderer/yuv.h>
 
 #include <vulkan/vulkan_format_traits.hpp>
 
@@ -63,7 +64,8 @@ static bool is_depth_stencil_compatible_format(SceGxmTextureBaseFormat format, b
 }
 
 VKTextureCache::VKTextureCache(VKState &state)
-    : state(state) {}
+    : state(state)
+    , yuv_converter(state) {}
 
 uint64_t VKTextureCache::release_all_cached_textures() {
     uint64_t freed = 0;
@@ -74,14 +76,16 @@ uint64_t VKTextureCache::release_all_cached_textures() {
 
         texture_lookup.erase(std::bit_cast<TextureGxmDataRepr>(info.texture));
         info.texture_size = 0;
-        info.dirty = false;
-        info.use_hash = false;
-        info.last_hash_scene = 0;
+        reset_tracking(info);
 
         TextureCacheEntry &entry = textures[info.index];
         if (entry.texture.image) {
             freed += entry.memory_needed;
             entry.texture.destroy();
+        }
+        if (entry.yuv) {
+            yuv_converter.destroy_entry_now(*entry.yuv);
+            entry.yuv.reset();
         }
         entry.memory_needed = 0;
     }
@@ -90,11 +94,20 @@ uint64_t VKTextureCache::release_all_cached_textures() {
     return freed;
 }
 
+bool VKTextureCache::gpu_may_write_guest_range(uint32_t begin, uint32_t end) const {
+    return state.surface_cache.gpu_writes_guest_range(begin, end);
+}
+
 void VKTextureCache::cleanup() {
     for (auto &entry : textures) {
         if (entry.texture.image)
             entry.texture.destroy();
+        if (entry.yuv) {
+            yuv_converter.destroy_entry_now(*entry.yuv);
+            entry.yuv.reset();
+        }
     }
+    yuv_converter.cleanup();
 
     for (auto &sampler : samplers)
         state.device.destroy(sampler);
@@ -237,6 +250,13 @@ void sync_texture(VKContext &context, MemState &mem, std::size_t index, SceGxmTe
     }
 
     if (context.state.features.use_texture_viewport) {
+        if (!texture.normalize_mode) {
+            // Unnormalized texture: the guest samples with texel unit coordinates, the shader turns them into
+            // normalized ones through the same scale it uses for surface views (see configure_sampler)
+            texture_viewport.ratio.first /= static_cast<float>(std::max(gxm::get_width(texture), 1U));
+            texture_viewport.ratio.second /= static_cast<float>(std::max(gxm::get_height(texture), 1U));
+        }
+
         if (is_vertex) {
             context.curr_vert_ublock.set_viewport_ratio(index - SCE_GXM_MAX_TEXTURE_UNITS, texture_viewport.ratio);
             context.curr_vert_ublock.set_viewport_offset(index - SCE_GXM_MAX_TEXTURE_UNITS, texture_viewport.offset);
@@ -365,20 +385,21 @@ void VKTextureCache::prepare_staging_buffer(bool is_configure) {
         .layerCount = current_texture->is_cube ? 6U : 1U
     };
 
-    // if this is done during configure, layout is undefined, otherwise it is shader read only
-    if (is_configure)
-        vkutil::transition_image_layout(cmd_buffer, current_texture->texture.image, vkutil::ImageLayout::Undefined, vkutil::ImageLayout::TransferDst, range);
+    // if this is done during configure, layout is undefined, otherwise it is shader read only;
+    // a partial upload keeps the rows it does not write
+    if (is_configure || partial_upload)
+        current_texture->texture.transition_to(cmd_buffer, vkutil::ImageLayout::TransferDst, range);
     else
-        vkutil::transition_image_layout_discard(cmd_buffer, current_texture->texture.image, vkutil::ImageLayout::SampledImage, vkutil::ImageLayout::TransferDst, range);
+        current_texture->texture.transition_to_discard(cmd_buffer, vkutil::ImageLayout::TransferDst, range);
 
     is_texture_transfer_ready = true;
 }
 
-bool VKTextureCache::init(const bool hashless_texture_cache, const fs::path &texture_folder, const std::string_view game_id) {
+bool VKTextureCache::init(const fs::path &texture_folder, const std::string_view game_id) {
     // set a limit to the number of samplers which can be allocated at the same time
     const size_t max_sampler_used = std::min(state.physical_device_properties.limits.maxSamplerAllocationCount / 2, 512U);
 
-    TextureCache::init(hashless_texture_cache, texture_folder, game_id, max_sampler_used);
+    TextureCache::init(texture_folder, game_id, max_sampler_used);
     backend = Backend::Vulkan;
 
     samplers.resize(max_sampler_used);
@@ -411,6 +432,8 @@ bool VKTextureCache::init(const bool hashless_texture_cache, const fs::path &tex
     // check for astc support
     const vk::FormatProperties astc_support = state.physical_device.getFormatProperties(vk::Format::eAstc4x4SrgbBlock);
     support_astc = static_cast<bool>(astc_support.optimalTilingFeatures & vk::FormatFeatureFlagBits::eSampledImage);
+
+    yuv_converter.init();
 
     return true;
 }
@@ -529,6 +552,32 @@ void VKTextureCache::configure_texture(const SceGxmTexture &gxm_texture) {
         }
     }
 
+    // YUV textures are converted on the GPU into the RGBA8 image whenever the device has a route for it
+    if (current_texture->yuv) {
+        yuv_converter.destroy_entry(*current_texture->yuv);
+        current_texture->yuv.reset();
+    }
+    if (gxm::is_yuv_format(base_format) && !is_cube) {
+        const yuv::Kind kind = (base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV422) ? yuv::Kind::Packed422
+            : (base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV420P3 ? yuv::Kind::P3 : yuv::Kind::P2);
+        const SceGxmTextureType type = gxm_texture.texture_type();
+        // packed 4:2:2 is only converted on the GPU when linear, the other layouts are unswizzled on the CPU first
+        const bool layout_ok = kind != yuv::Kind::Packed422 || type == SCE_GXM_TEXTURE_LINEAR || type == SCE_GXM_TEXTURE_LINEAR_STRIDED;
+        // the profile is stored in unk2 by renderer::set_texture
+        const uint8_t profile = static_cast<uint8_t>(gxm_texture.unk2);
+        const uint8_t swizzle = static_cast<uint8_t>(gxm_texture.swizzle_format);
+        const yuv::Route route = layout_ok ? yuv_converter.select_route(kind, profile, swizzle) : yuv::Route::Cpu;
+        if (route != yuv::Route::Cpu) {
+            auto data = std::make_unique<YuvEntryData>();
+            if (yuv_converter.create_entry(*data, route, kind, profile, swizzle, width, height)) {
+                current_texture->yuv = std::move(data);
+                // the converted image is written by a compute pass: single mip, no sRGB view of the storage image
+                vk_format = vk::Format::eR8G8B8A8Unorm;
+                mip_count = 1;
+            }
+        }
+    }
+
     current_texture->mip_count = mip_count;
     current_texture->is_cube = is_cube;
     uint32_t memory_needed = get_image_memory_upper_bound(gxm_texture, vk_format, base_format);
@@ -564,7 +613,8 @@ void VKTextureCache::configure_texture(const SceGxmTexture &gxm_texture) {
         .arrayLayers = is_cube ? 6U : 1U,
         .samples = vk::SampleCountFlagBits::e1,
         .tiling = vk::ImageTiling::eOptimal,
-        .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
+        .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst
+            | (current_texture->yuv ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags()),
         .sharingMode = vk::SharingMode::eExclusive,
         .initialLayout = vk::ImageLayout::eUndefined,
     };
@@ -588,9 +638,6 @@ void VKTextureCache::configure_texture(const SceGxmTexture &gxm_texture) {
         .subresourceRange = range
     };
     image.view = state.device.createImageView(view_info);
-
-    if (!gxm_texture.normalize_mode)
-        LOG_ERROR("Unhandled unnormalized texture, please report it to the developers");
 
     prepare_staging_buffer(true);
 }
@@ -676,7 +723,7 @@ void VKTextureCache::upload_texture_impl(SceGxmTextureBaseFormat base_format, ui
         .bufferRowLength = pixels_per_stride,
         .bufferImageHeight = buffer_height,
         .imageSubresource = layer,
-        .imageOffset = { 0, 0, 0 },
+        .imageOffset = { 0, static_cast<int32_t>(upload_row_offset), 0 },
         .imageExtent = { width, height, 1 }
     };
     cmd_buffer.copyBufferToImage(staging_buffer.buffer.buffer, image.image, vk::ImageLayout::eTransferDstOptimal, region);
@@ -692,6 +739,15 @@ void VKTextureCache::upload_done() {
         return;
     }
 
+    if (current_texture->yuv && current_texture->yuv->pending) {
+        // the planes are in place: convert them into the texture (leaves it ready for sampling)
+        yuv_converter.finish_upload(*this, *current_texture);
+        current_texture->texture.layout = vkutil::ImageLayout::SampledImage;
+        cmd_buffer = nullptr;
+        is_texture_transfer_ready = false;
+        return;
+    }
+
     // transition the texture back to read only
     vk::ImageSubresourceRange range{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -700,11 +756,23 @@ void VKTextureCache::upload_done() {
         .baseArrayLayer = 0,
         .layerCount = current_texture->is_cube ? 6U : 1U
     };
-    vkutil::transition_image_layout(cmd_buffer, current_texture->texture.image, vkutil::ImageLayout::TransferDst, vkutil::ImageLayout::SampledImage, range);
-    current_texture->texture.layout = vkutil::ImageLayout::SampledImage;
+    current_texture->texture.transition_to(cmd_buffer, vkutil::ImageLayout::SampledImage, range);
     // this should not be necessary
     cmd_buffer = nullptr;
     is_texture_transfer_ready = false;
+}
+
+bool VKTextureCache::upload_yuv_gpu(const SceGxmTexture &texture, SceGxmTextureBaseFormat base_format, const uint8_t *src, uint32_t width, uint32_t height, uint32_t stride_pixels, uint32_t layout_width, uint32_t layout_height) {
+    TextureCacheEntry &entry = *current_texture;
+    if (!entry.yuv || entry.yuv->route == yuv::Route::Cpu)
+        return false;
+
+    if (!is_texture_transfer_ready)
+        prepare_staging_buffer();
+    if (!is_texture_transfer_ready)
+        return false;
+
+    return yuv_converter.upload(*this, entry, texture, base_format, src, width, height, stride_pixels, layout_width, layout_height);
 }
 
 bool VKTextureCache::format_supports_sampled_image(vk::Format format) {
@@ -741,35 +809,67 @@ void VKTextureCache::configure_sampler(size_t index, const SceGxmTexture &textur
     // Their sampler key excludes those fields, so do not interpret them as LOD state.
     const bool is_linear_strided = texture.texture_type() == SCE_GXM_TEXTURE_LINEAR_STRIDED;
 
+    // Unnormalized (texel unit) coordinates: the shader scales the coordinates when it has the texture viewport
+    // (see sync_texture), otherwise the sampler does it with unnormalizedCoordinates
+    renderer::SamplerSupport support = state.sampler_support;
+    support.unnormalized_in_shader = state.features.use_texture_viewport;
+    const bool unnormalized = !texture.normalize_mode;
+    const bool unnormalized_sampler = unnormalized && !support.unnormalized_in_shader;
+
     const SceGxmTextureAddrMode uaddr = static_cast<SceGxmTextureAddrMode>(texture.uaddr_mode);
     const SceGxmTextureAddrMode vaddr = static_cast<SceGxmTextureAddrMode>(texture.vaddr_mode);
     // Note: I don't know what to do with the MIPMAP version of SceGxmTextureFilter
     SceGxmTextureFilter mag_filter = static_cast<SceGxmTextureFilter>(texture.mag_filter);
     SceGxmTextureFilter min_filter = is_linear_strided ? mag_filter : static_cast<SceGxmTextureFilter>(texture.min_filter);
 
-    if (no_linear) {
-        min_filter = SCE_GXM_TEXTURE_FILTER_POINT;
-        mag_filter = SCE_GXM_TEXTURE_FILTER_POINT;
+    if (no_linear || unnormalized_sampler) {
+        // an unnormalizedCoordinates sampler needs the same min and mag filter
+        if (no_linear) {
+            min_filter = SCE_GXM_TEXTURE_FILTER_POINT;
+            mag_filter = SCE_GXM_TEXTURE_FILTER_POINT;
+        } else {
+            min_filter = mag_filter;
+        }
+    }
+
+    // Unnormalized textures have no mip chain to select from
+    const bool no_mips = is_linear_strided || unnormalized;
+
+    vk::SamplerAddressMode address_u = texture::translate_address_mode(uaddr, support.mirror_clamp_to_edge);
+    vk::SamplerAddressMode address_v = texture::translate_address_mode(vaddr, support.mirror_clamp_to_edge);
+    if (unnormalized_sampler) {
+        // the only address modes allowed with unnormalizedCoordinates
+        const auto clamp_only = [](vk::SamplerAddressMode mode) {
+            return mode == vk::SamplerAddressMode::eClampToBorder ? mode : vk::SamplerAddressMode::eClampToEdge;
+        };
+        address_u = clamp_only(address_u);
+        address_v = clamp_only(address_v);
     }
 
     // create sampler
     vk::SamplerCreateInfo sampler_info{
         .magFilter = texture::translate_filter(mag_filter),
         .minFilter = texture::translate_filter(min_filter),
-        .mipmapMode = !is_linear_strided && texture.mip_filter && !no_linear ? vk::SamplerMipmapMode::eLinear : vk::SamplerMipmapMode::eNearest,
-        .addressModeU = texture::translate_address_mode(uaddr),
-        .addressModeV = texture::translate_address_mode(vaddr),
+        .mipmapMode = !no_mips && texture.mip_filter && !no_linear ? vk::SamplerMipmapMode::eLinear : vk::SamplerMipmapMode::eNearest,
+        .addressModeU = address_u,
+        .addressModeV = address_v,
         .addressModeW = vk::SamplerAddressMode::eRepeat,
-        .mipLodBias = is_linear_strided ? 0.f : (static_cast<float>(texture.lod_bias) - 31.f) / 8.f,
-        .maxAnisotropy = static_cast<float>(anisotropic_filtering),
+        // the bias must stay inside the device limit
+        .mipLodBias = no_mips ? 0.f : renderer::translate_lod_bias(texture.lod_bias, support.max_lod_bias),
+        .maxAnisotropy = 1.f,
         .compareEnable = VK_FALSE,
-        .minLod = is_linear_strided ? 0.f : static_cast<float>(texture.true_lod_min()),
-        .maxLod = VK_LOD_CLAMP_NONE,
-        .unnormalizedCoordinates = VK_FALSE,
+        .minLod = no_mips ? 0.f : static_cast<float>(texture.true_lod_min()),
+        .maxLod = unnormalized ? 0.f : VK_LOD_CLAMP_NONE,
+        // GXM has no programmable border colour: the border modes sample transparent black (see sampler_state.h)
+        .borderColor = vk::BorderColor::eFloatTransparentBlack,
+        .unnormalizedCoordinates = unnormalized_sampler ? VK_TRUE : VK_FALSE,
     };
 
     // when using nearest filter, disable anisotropy as the pixels can contain data other than color
-    sampler_info.anisotropyEnable = (anisotropic_filtering > 1) && (sampler_info.magFilter != vk::Filter::eNearest || sampler_info.minFilter != vk::Filter::eNearest);
+    const renderer::AnisotropyPlan anisotropy = renderer::plan_anisotropy(anisotropic_filtering, support,
+        sampler_info.magFilter != vk::Filter::eNearest, sampler_info.minFilter != vk::Filter::eNearest, unnormalized_sampler);
+    sampler_info.anisotropyEnable = anisotropy.enable;
+    sampler_info.maxAnisotropy = anisotropy.max_anisotropy;
 
     sampler = state.device.createSampler(sampler_info);
 }

@@ -550,8 +550,6 @@
     <string name="settings_cpu_pool_size">CPUプールサイズ</string>
     <string name="settings_help_cpu_pool_size">エミュレーターが使用するワーカースレッド数を設定します。\n\nゲームが遅い、スタッターする、またはデバイスに高速な経路を試すだけのCPU/GPUの余裕がある場合に使用します。クラッシュ、音の割れ、過熱、バッテリー消費、タイミングの崩れが見られる場合は、オフに戻すか値を下げてください。</string>
     <string name="settings_cpu_pool_size_value">%1$dワーカー</string>
-    <string name="settings_hashless_texture_cache">ハッシュレステクスチャキャッシュ</string>
-    <string name="settings_help_hashless_texture_cache">より積極的なテクスチャキャッシュモードを使用します。\n\n初回実行後のシェーダーやテクスチャのスタッターを減らすために使用します。ゲームでテクスチャの破損、ブラックスクリーン、キャッシュ後の再現性のあるクラッシュが発生する場合にのみ無効にしてください。</string>
     <string name="settings_shader_cache">シェーダーキャッシュ</string>
     <string name="settings_help_shader_cache">コンパイル済みシェーダーを実行間で保持し、スタッターを減らします。\n\n初回実行後のシェーダーやテクスチャのスタッターを減らすために使用します。ゲームでテクスチャの破損、ブラックスクリーン、キャッシュ後の再現性のあるクラッシュが発生する場合にのみ無効にしてください。</string>
     <string name="settings_pixel_perfect_fullscreen">ピクセルパーフェクト全画面</string>
@@ -1486,6 +1484,9 @@
     <string name="emulation_savestate_loaded_toast">読み込みました</string>
     <string name="emulation_savestate_deleted_toast">削除しました</string>
     <string name="emulation_savestate_failed_toast">操作に失敗しました</string>
+    <string name="emulation_savestate_other_version_toast">このステートセーブは別のバージョンのアプリで作成されたため読み込めません。ファイルは保持されています。</string>
+    <string name="emulation_savestate_other_version_boot_toast">クイックセーブは別のバージョンのアプリで作成されたため読み込めません。ゲームを通常どおり起動します。ファイルは保持されています。</string>
+    <string name="emulation_savestate_vulkan_only">ステートセーブには Vulkan レンダラーが必要です</string>
     <string name="emulation_savestate_refused_no_game">ゲームが実行されていないため、状態を保存できません</string>
     <string name="emulation_savestate_refused_exiting">ゲームを終了中です。しばらくしてからお試しください</string>
     <string name="emulation_savestate_refused_loading">ゲームを読み込み中です。少し待ってからお試しください</string>

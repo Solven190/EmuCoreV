@@ -160,6 +160,11 @@ VKContext::~VKContext() {
     for (auto &[addr, vb] : visibility_buffers)
         state.device.destroy(vb.query_pool);
     visibility_buffers.clear();
+    for (const vk::QueryPool pool : retired_query_pools)
+        state.device.destroy(pool);
+    for (auto &resolve : pending_visibility)
+        resolve->staging.destroy();
+    pending_visibility.clear();
 
     state.device.destroy(global_descriptor_pool);
     global_descriptor_pool = nullptr;
@@ -201,7 +206,7 @@ VKRenderTarget::VKRenderTarget(VKState &state, const SceGxmRenderTargetParams &p
     // color
     color.transition_to_discard(cmd_buffer, vkutil::ImageLayout::ColorAttachmentReadWrite);
     // depth stencil
-    depthstencil.transition_to_discard(cmd_buffer, vkutil::ImageLayout::DepthStencilAttachment, vkutil::ds_subresource_range);
+    depthstencil.transition_to_discard(cmd_buffer, vkutil::ImageLayout::DepthStencilReadOnly, vkutil::ds_subresource_range); // the layout every loading pass declares as initialLayout (pipeline_cache.cpp), see docs/gpu-sync-tracker.md hazard 1
     vkutil::end_single_time_command(state.device, state.general_queue, state.general_command_pool, cmd_buffer);
 
     constexpr uint16_t SCE_GXM_MAX_SCENES_PER_RENDERTARGET = 8;
@@ -253,7 +258,7 @@ void VKRenderTarget::prepare_resize(VKState &state, float multiplier, ResizedIma
 
     vk::CommandBuffer cmd_buffer = vkutil::create_single_time_command(state.device, state.general_command_pool);
     images.color.transition_to_discard(cmd_buffer, vkutil::ImageLayout::ColorAttachmentReadWrite);
-    images.depthstencil.transition_to_discard(cmd_buffer, vkutil::ImageLayout::DepthStencilAttachment, vkutil::ds_subresource_range);
+    images.depthstencil.transition_to_discard(cmd_buffer, vkutil::ImageLayout::DepthStencilReadOnly, vkutil::ds_subresource_range);
     vkutil::end_single_time_command(state.device, state.general_queue, state.general_command_pool, cmd_buffer);
 
     out = std::move(images);
@@ -380,8 +385,8 @@ bool create(std::unique_ptr<FragmentProgram> &fp, VKState &state, const SceGxmPr
             .srcColorBlendFactor = color_is_blended ? translate_blend_factor(blend->colorSrc) : vk::BlendFactor::eOne,
             .dstColorBlendFactor = color_is_blended ? translate_blend_factor(blend->colorDst) : vk::BlendFactor::eZero,
             .colorBlendOp = translate_blend_func(blend->colorFunc),
-            .srcAlphaBlendFactor = alpha_is_blended ? translate_blend_factor(blend->alphaSrc) : vk::BlendFactor::eOne,
-            .dstAlphaBlendFactor = alpha_is_blended ? translate_blend_factor(blend->alphaDst) : vk::BlendFactor::eZero,
+            .srcAlphaBlendFactor = alpha_is_blended ? translate_blend_factor_alpha(blend->alphaSrc) : vk::BlendFactor::eOne,
+            .dstAlphaBlendFactor = alpha_is_blended ? translate_blend_factor_alpha(blend->alphaDst) : vk::BlendFactor::eZero,
             .alphaBlendOp = translate_blend_func(blend->alphaFunc),
             .colorWriteMask = color_mask
         };

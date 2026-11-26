@@ -16,6 +16,8 @@ struct RenderVertUniformBlock {
     float screen_height;
     float z_offset;
     float z_scale;
+    // size of the points of a program that writes no PSIZE (the point width register)
+    float point_size;
 };
 
 // used internally to identify the field by the shader recompiler
@@ -26,7 +28,8 @@ enum VertUniformFieldId : uint32_t {
     VERT_UNIFORM_screen_width,
     VERT_UNIFORM_screen_height,
     VERT_UNIFORM_z_offset,
-    VERT_UNIFORM_z_scale
+    VERT_UNIFORM_z_scale,
+    VERT_UNIFORM_point_size
 };
 
 struct RenderFragUniformBlock {
@@ -41,7 +44,15 @@ struct RenderFragUniformBlock {
     float inv_frag_height = 1.0f;
     float raw_cast_mask = 0.0f;
     float iterator_written_mask = 16777215.0f;
+    // 1 when the colour surface has its dither bit set (only read by shaders writing a surface with less than 8 bits per channel)
+    float dither_enabled = 0.0f;
+    // point sprite coordinate modes of the polygon mode (1: that axis runs from 1 to 0)
+    float point_flip_u = 0.0f;
+    float point_flip_v = 0.0f;
+    // the extended members that follow must start 16 byte aligned (uniform buffer layout of the arrays): keep sizeof a multiple of 16
+    float reserved[2] = {};
 };
+static_assert(sizeof(RenderFragUniformBlock) % 16 == 0, "RenderFragUniformBlock must stay a multiple of 16 bytes");
 
 enum FragUniformFieldId : uint32_t {
     FRAG_UNIFORM_back_disabled,
@@ -54,7 +65,10 @@ enum FragUniformFieldId : uint32_t {
     FRAG_UNIFORM_inv_frag_width,
     FRAG_UNIFORM_inv_frag_height,
     FRAG_UNIFORM_raw_cast_mask,
-    FRAG_UNIFORM_iterator_written_mask
+    FRAG_UNIFORM_iterator_written_mask,
+    FRAG_UNIFORM_dither_enabled,
+    FRAG_UNIFORM_point_flip_u,
+    FRAG_UNIFORM_point_flip_v
 };
 
 template <typename T>

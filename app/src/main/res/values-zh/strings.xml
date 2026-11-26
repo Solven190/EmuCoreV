@@ -257,8 +257,6 @@
     <string name="settings_cpu_pool_size">CPU 池大小</string>
     <string name="settings_help_cpu_pool_size">設定模擬器使用的執行緒數量。\n\n当游戏变慢、卡顿，或设备还有足够 CPU/GPU 余量时使用。若出现崩溃、音频爆音、发热、耗电增加或时序异常，请关闭或降低。</string>
     <string name="settings_cpu_pool_size_value">%1$d 個執行緒</string>
-    <string name="settings_hashless_texture_cache">無雜湊紋理快取 (Hashless texture cache)</string>
-    <string name="settings_help_hashless_texture_cache">使用更積極的紋理快取模式。\n\n用于减少首次运行后着色器或纹理造成的卡顿。只有在出现纹理损坏、黑屏或缓存后稳定复现崩溃时才关闭。</string>
     <string name="settings_shader_cache">著色器快取</string>
     <string name="settings_help_shader_cache">跨執行緒保留已編譯的著色器以減少卡頓。\n\n用于减少首次运行后着色器或纹理造成的卡顿。只有在出现纹理损坏、黑屏或缓存后稳定复现崩溃时才关闭。</string>
     <string name="settings_pixel_perfect_fullscreen">像素完美全螢幕</string>
@@ -1484,6 +1482,9 @@
     <string name="emulation_savestate_loaded_toast">已读取</string>
     <string name="emulation_savestate_deleted_toast">已删除</string>
     <string name="emulation_savestate_failed_toast">操作失败</string>
+    <string name="emulation_savestate_other_version_toast">此即时存档由其他版本的应用创建，无法载入。文件已保留。</string>
+    <string name="emulation_savestate_other_version_boot_toast">快速存档由其他版本的应用创建，无法载入。游戏将正常启动；文件已保留。</string>
+    <string name="emulation_savestate_vulkan_only">存档状态需要 Vulkan 渲染器</string>
     <string name="emulation_savestate_refused_no_game">当前没有运行的游戏，无法保存状态</string>
     <string name="emulation_savestate_refused_exiting">游戏正在关闭，请稍后再试</string>
     <string name="emulation_savestate_refused_loading">游戏仍在加载，请稍后再试</string>

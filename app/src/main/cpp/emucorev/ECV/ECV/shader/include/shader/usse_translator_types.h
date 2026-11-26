@@ -74,6 +74,10 @@ struct SpirvShaderParameters {
     // Store boolean, use for conditional execution.
     SpirvVarRegBank predicates;
 
+    // Mapped to the USSE GLOBAL register bank (g0-g63, bank SPECIAL with bit 6 set). Created lazily by the first access (0 = not created):
+    // only a few shaders touch it, and the hardware-defined meaning of its registers is mostly unknown (see usse_utilities.cpp).
+    mutable SpirvVarRegBank globals = 0;
+
     // Sampler map. Since all banks are a flat array, sampler must be in an explicit bank.
     SamplerMap samplers;
 
@@ -87,6 +91,10 @@ struct SpirvShaderParameters {
 
     // when not using buffer device address, contains the storage buffer type
     spv::Id buffer_container;
+
+    // the device allows stores to buffers in this shader stage (vertexPipelineStoresAndAtomics / fragmentStoresAndAtomics); without it
+    // a store instruction is dropped instead of emitting SPIR-V the device cannot run
+    bool buffer_stores_supported = true;
 
     // ids for the given fields in the uniform block container
     int buffer_addresses_id;

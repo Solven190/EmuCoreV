@@ -36,7 +36,6 @@ struct FragmentProgram;
 struct RenderTarget;
 struct State;
 struct VertexProgram;
-struct YUVConversionCache;
 
 bool create(std::unique_ptr<FragmentProgram> &fp, State &state, const SceGxmProgram &program, const SceGxmBlendInfo *blend, GXPPtrMap &gxp_ptr_map);
 bool create(std::unique_ptr<VertexProgram> &vp, State &state, const SceGxmProgram &program, GXPPtrMap &gxp_ptr_map, const std::vector<SceGxmVertexAttribute> &attributes);
@@ -90,6 +89,7 @@ void set_stencil_ref(State &state, Context *ctx, bool is_front, unsigned char sr
 void set_program(State &state, Context *ctx, Ptr<const void> program, const bool is_fragment);
 void set_cull_mode(State &state, Context *ctx, SceGxmCullMode cull);
 void set_texture(State &state, Context *ctx, const std::uint32_t tex_index, const SceGxmTexture tex);
+void set_yuv_profile(Context *ctx, bool is_fragment, uint32_t csc_index, uint8_t profile);
 void set_viewport_real(State &state, Context *ctx, float xOffset, float yOffset, float zOffset, float xScale, float yScale, float zScale);
 void set_viewport_flat(State &state, Context *ctx);
 void set_region_clip(State &state, Context *ctx, SceGxmRegionClipMode mode, unsigned int xMin, unsigned int xMax, unsigned int yMin, unsigned int yMax);
@@ -98,6 +98,7 @@ void set_side_fragment_program_enable(State &state, Context *ctx, const bool is_
 void set_uniform_buffer(State &state, Context *ctx, const bool is_vertex_uniform, const int block_num, const std::uint16_t buffer_size, const Ptr<const void> buffer);
 void set_visibility_buffer(State &state, Context *ctx, Ptr<uint32_t> visibility_address, uint32_t visibility_stride);
 void set_visibility_index(State &state, Context *ctx, bool enable, uint32_t index, bool is_increment);
+void set_visibility_index_back(State &state, Context *ctx, bool enable, uint32_t index, bool is_increment);
 
 void set_context(State &state, Context *ctx, RenderTarget *target, SceGxmColorSurface *color_surface, SceGxmDepthStencilSurface *depth_stencil_surface);
 void set_vertex_stream(State &state, Context *ctx, const std::size_t index, const std::size_t data_len, const Ptr<const void> stream);
@@ -186,7 +187,8 @@ namespace texture {
 // Paletted textures.
 void palette_texture_to_rgba_4(uint32_t *dst, const uint8_t *src, uint32_t width, uint32_t height, const uint32_t *palette);
 void palette_texture_to_rgba_8(uint32_t *dst, const uint8_t *src, uint32_t width, uint32_t height, const uint32_t *palette);
-void yuv420_texture_to_rgb(YUVConversionCache &cache, uint8_t *dst, const uint8_t *src, uint32_t width, uint32_t height, uint32_t layout_width, uint32_t layout_height, bool is_p3);
+void yuv420_texture_to_rgb(uint8_t profile, bool chroma_swapped, uint8_t *dst, const uint8_t *src, uint32_t width, uint32_t height, uint32_t layout_width, uint32_t layout_height, bool is_p3);
+void yuv422_texture_to_rgb(uint8_t profile, uint32_t swizzle, uint8_t *dst, const uint8_t *src, uint32_t width, uint32_t height);
 const uint32_t *get_texture_palette(const SceGxmTexture &texture, const MemState &mem);
 
 // Assume fmt is a bcn format
@@ -284,7 +286,9 @@ uint32_t decode_morton2_y(uint32_t code);
 uint32_t encode_morton(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
 bool can_texture_be_unswizzled_without_decode(SceGxmTextureBaseFormat fmt, bool is_vulkan);
 uint32_t get_compressed_size(SceGxmTextureBaseFormat base_format, uint32_t width, uint32_t height);
-uint64_t hash_texture_data(const SceGxmTexture &texture, uint32_t texture_size, const MemState &mem);
+// hash of the texture bytes only (the palette of P4/P8 textures is hashed on its own), 0 when the range is not mapped
+uint64_t hash_texture_pixels(const SceGxmTexture &texture, uint32_t texture_size, const MemState &mem);
+uint64_t hash_texture_palette(const SceGxmTexture &texture, const MemState &mem);
 // hash texture used for texture replacement such that byte in the stride are not hashed
 // this prevent texture duplication in case there are random bytes in the stride
 uint64_t hash_texture_nostride(const SceGxmTexture &texture, const MemState &mem);

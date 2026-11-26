@@ -18,11 +18,16 @@
 #pragma once
 
 #include <renderer/texture_cache.h>
+#include <renderer/vulkan/msaa.h>
 
 #include <renderer/types.h>
 #include <renderer/vulkan/depth_stencil_model.h>
+#include <renderer/vulkan/raster_model.h>
+#include <renderer/vulkan/buffer_store_model.h>
+#include <renderer/vulkan/visibility_model.h>
 #include <shader/uniform_block.h>
 #include <renderer/vulkan/frame_command_buffer_cursor.h>
+#include <renderer/vulkan/yuv_convert.h>
 #include <unordered_map>
 #include <vkutil/objects.h>
 
@@ -55,6 +60,8 @@ struct TextureCacheEntry {
     bool is_cube;
     uint16_t mip_count;
     uint32_t memory_needed;
+    // GPU side of a YUV texture (null for every other texture)
+    std::unique_ptr<YuvEntryData> yuv;
 };
 
 struct VKTextureCache : public TextureCache {
@@ -78,15 +85,21 @@ struct VKTextureCache : public TextureCache {
     vk::CommandBuffer cmd_buffer = nullptr;
     bool is_texture_transfer_ready = false;
 
+    // YUV textures are converted on the GPU when the device allows it (see yuv_convert.h)
+    YuvConverter yuv_converter;
+
     VKTextureCache(VKState &state);
     // get an available staging buffer, wait for one if all are busy
     void prepare_staging_buffer(bool is_configure = false);
 
-    bool init(const bool hashless_texture_cache, const fs::path &texture_folder, const std::string_view game_id);
+    bool init(const fs::path &texture_folder, const std::string_view game_id);
     void select(size_t index, const SceGxmTexture &texture) override;
     void configure_texture(const SceGxmTexture &texture) override;
     void upload_texture_impl(SceGxmTextureBaseFormat base_format, uint32_t width, uint32_t height, uint32_t mip_index, const void *pixels, int face, uint32_t pixels_per_stride) override;
     void upload_done() override;
+    bool supports_partial_upload() const override { return true; }
+    bool gpu_may_write_guest_range(uint32_t begin, uint32_t end) const override;
+    bool upload_yuv_gpu(const SceGxmTexture &texture, SceGxmTextureBaseFormat base_format, const uint8_t *src, uint32_t width, uint32_t height, uint32_t stride_pixels, uint32_t layout_width, uint32_t layout_height) override;
     void configure_sampler(size_t index, const SceGxmTexture &texture, bool no_linear) override;
 
     bool format_supports_linear_filter(vk::Format format);
@@ -116,6 +129,11 @@ struct FrameObject {
     vk::CommandPool prerender_pool;
 
     std::vector<vk::Fence> rendered_fences;
+    // secondary command buffers of the deferred pass recording (allocated from render_pool, reused every frame)
+    std::vector<vk::CommandBuffer> secondary_cmds;
+    size_t secondary_cursor = 0;
+    // highest timeline value signalled by this frame slot's scene submits (0 = none / timeline tracking off)
+    uint64_t rendered_timeline_value = 0;
     // Changes whenever this shared frame slot's command pools are reset.
     uint64_t pool_epoch = 0;
 
@@ -184,15 +202,28 @@ struct BufferTrapping {
 // Use vulkan queries to implement visibility buffer
 struct VisibilityBuffer {
     Address address;
-    vk::Buffer gpu_buffer;
-    uint64_t buffer_offset;
-    uint32_t size;
+    uint32_t size; // entries of the guest buffer
     vk::QueryPool query_pool;
-    std::vector<bool> queries_used; // the queries that were used in the current scene
+    uint32_t pool_size; // query slots of the pool: one per entry plus visibility::spare_slots
+    visibility::SceneQueries scene; // the queries begun in the current scene
+};
+
+// The slot results of one scene (copied to a host readable buffer) and what they mean; the entries are written to guest memory
+// once the GPU has finished (wait thread, or inline without a wait thread).
+struct VisibilityResolve {
+    Address address = 0;
+    std::vector<visibility::Activation> activations;
+    vkutil::Buffer staging;
+};
+
+struct VisibilityResolveRequest {
+    std::shared_ptr<VisibilityResolve> resolve;
 };
 
 struct FenceWaitRequest {
     vk::Fence fence;
+    // timeline submit tracking: value the scene submit signals on VKState::submit_timeline (0 = not used, wait on the fence)
+    uint64_t timeline_value = 0;
 };
 
 // request to trigger a notification after the previous fences have been waited for
@@ -241,6 +272,7 @@ typedef std::variant<
     NotificationRequest,
     FrameDoneRequest,
     BufferSyncRequest,
+    VisibilityResolveRequest,
     PostSurfaceSyncRequest,
     SyncSignalRequest,
     CallbackRequest>
@@ -300,7 +332,33 @@ struct VKContext : public renderer::Context {
     int visibility_max_used_idx = -1;
     bool is_in_query = false;
     int current_query_idx = -1;
+    // region clip INSIDE: the rectangles outside the region, one draw per rectangle (count 0 for the other modes)
+    raster::Strips inside_clip;
     bool is_query_op_increment = false;
+    // back face visibility state (current_query_idx / is_query_op_increment are the front face ones); -1: disabled
+    int back_query_idx = -1;
+    bool back_query_op_increment = false;
+    // the query running right now (face state and slot of the pool of current_visibility_buffer)
+    visibility::Face running_query_face;
+    int running_query_slot = -1;
+    // resolves of the scene segments recorded but not submitted yet
+    std::vector<std::shared_ptr<VisibilityResolve>> pending_visibility;
+    // no memory mapping, USSE buffer stores (buffer_store_model.h): the uniform blocks uploaded for the draw being recorded, and for the draws of
+    // the scene whose shader stores into them: block + the guest bytes at upload time, written back after the scene's fence
+    std::vector<buffer_store::Block> draw_store_blocks;
+    struct PendingBufferStore {
+        buffer_store::Block block;
+        std::vector<uint8_t> before;
+    };
+    std::vector<PendingBufferStore> pending_buffer_stores;
+    // collects the blocks of the draw just recorded when its pipeline stores into the guest buffers
+    void collect_buffer_stores(MemState &mem);
+    // after the scene's fence: writes the bytes the shaders changed back to guest memory
+    void apply_buffer_stores(MemState &mem);
+    // DoubleBuffer: mirror -> guest forwards of colour transfers recorded since the last submit (pushed behind that submit's fence)
+    std::vector<BufferSyncRequest> pending_buffer_syncs;
+    std::optional<BufferSyncRequest> make_buffer_sync_request(const ColorSurfaceCacheInfo &info);
+    std::vector<vk::QueryPool> retired_query_pools; // replaced by a bigger pool, destroyed with the context
 
     // descriptor pool for dynamic uniforms (allocated once for the whole game)
     vk::DescriptorPool global_descriptor_pool;
@@ -323,6 +381,8 @@ struct VKContext : public renderer::Context {
     SceGxmPrimitiveType last_primitive;
 
     vk::RenderPass current_render_pass;
+    // multisampling of the current scene (B140)
+    MsaaScene ms_scene;
     vk::RenderPass current_shader_interlock_pass = nullptr;
     vk::Pipeline current_pipeline;
     // second pipeline of a draw split by facing (see dsmodel::FacePlan), null when the draw is a single pass
@@ -346,7 +406,36 @@ struct VKContext : public renderer::Context {
     vk::Framebuffer current_framebuffer;
     vk::Framebuffer current_shader_interlock_framebuffer = nullptr;
     // we need the format or image for some cases
-    vkutil::Image *current_color_base_image;
+    vkutil::Image *current_color_base_image = nullptr;
+    vkutil::Image *current_ds_image = nullptr;
+    // the colour attachment is backed by a surface (loaded), not the transient/unbacked one (initial layout Undefined)
+    bool current_color_loaded = true;
+    // RenderPath::DynamicRendering: what the scene's pass instances begin with (the VkRenderPass objects' loadOp/storeOp/formats)
+    struct DynamicPass {
+        bool has_raw = false; // second colour attachment (R16G16B16A16_UINT raw bits of an F16 surface)
+        bool depth_load = false;
+        bool stencil_load = false;
+        bool guest_store = false; // the game asked for the depth to be written back (only meaningful with a guest surface behind the depth)
+    } dyn_pass, inst_pass;
+    // deferred pass recording: draws go into pass_secondary, the instance is begun when it ends
+    vk::CommandBuffer primary_cmd{};
+    vk::CommandBuffer pass_secondary{};
+    vk::Rect2D pass_area{};
+    vk::ClearDepthStencilValue pass_ds_clear{};
+    bool interlock_pass_active = false;
+    // dynamic cull mode last set on the running secondary command buffer (extended dynamic state)
+    vk::CullModeFlags applied_cull{};
+    bool applied_cull_valid = false;
+    dsmodel::PassVariant draw_variant[2] = {};
+    // dirty-rect coverage of the running instance: draws recorded so far, and whether a full-area clear came before the first draw (the loaded content is then dead)
+    uint32_t instance_draws = 0;
+    uint32_t instance_queries = 0;
+    vkutil::sync::IRect inst_rect{}; // union of scissor x viewport of the draws of the running instance
+    bool inst_depth_overwritten = false;
+    bool inst_stencil_overwritten = false;
+    // restarts of the pass inside the current scene (look-ahead statistics, docs/gpu-sync-tracker.md section 9)
+    uint32_t scene_pass_starts = 0;
+    bool scene_depth_unbacked = false;
     vk::Format current_color_format;
     vk::ImageView current_color_view;
     vk::ImageView current_ds_view;
@@ -399,11 +488,16 @@ struct VKContext : public renderer::Context {
 
     void start_recording(bool first_in_scene = false);
     void start_render_pass(bool create_descriptor_set = true);
-    void stop_render_pass();
-    void stop_recording(const SceGxmNotification &notif1, const SceGxmNotification &notif2, bool submit = true);
+    // RenderPath::DynamicRendering: tracker barriers + vkCmdBeginRendering / vkCmdEndRendering + the barriers the pass dependencies used to be
+    void begin_deferred_pass();
+    void emit_pass(bool scene_end);
+    // scene_end: this is the last pass instance of the scene (sceGxmEndScene), not a restart
+    void stop_render_pass(bool scene_end = false);
+    // drops a recording that has no scene content (live resolution change)
+    void abandon_empty_recording();
+    void stop_recording(const SceGxmNotification &notif1, const SceGxmNotification &notif2, bool submit = true, bool scene_end = false);
     // Drop an open recording that has no recorded work (an empty scene-segment checkpoint) without
     // submitting it, so the scene can be re-entered with another framebuffer.
-    void abandon_empty_recording();
 
     // check (when the render target has macroblock set) if we are drawing to another block
     void check_for_macroblock_change(bool is_draw);

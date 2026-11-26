@@ -257,8 +257,6 @@
     <string name="settings_cpu_pool_size">Tamanho do pool da CPU</string>
     <string name="settings_help_cpu_pool_size">Define quantos threads de trabalho o emulador usará.\n\nUse isto quando um jogo estiver lento, travando ou quando o dispositivo tiver folga de CPU/GPU. Desative ou reduza se houver crashes, estalos no áudio, aquecimento, alto consumo de bateria ou timing quebrado.</string>
     <string name="settings_cpu_pool_size_value">%1$d threads</string>
-    <string name="settings_hashless_texture_cache">Cache de textura sem hash</string>
-    <string name="settings_help_hashless_texture_cache">Usa um modo de cache de textura mais agressivo.\n\nUse isto para reduzir travadas de shaders ou texturas depois da primeira execução. Desative apenas se o jogo mostrar texturas corrompidas, tela preta ou crashes repetíveis após o cache.</string>
     <string name="settings_shader_cache">Cache de shader</string>
     <string name="settings_help_shader_cache">Mantém os shaders compilados entre as execuções para reduzir travamentos.\n\nUse isto para reduzir travadas de shaders ou texturas depois da primeira execução. Desative apenas se o jogo mostrar texturas corrompidas, tela preta ou crashes repetíveis após o cache.</string>
     <string name="settings_pixel_perfect_fullscreen">Tela cheia pixel perfect</string>
@@ -1487,6 +1485,9 @@
     <string name="emulation_savestate_loaded_toast">Carregado</string>
     <string name="emulation_savestate_deleted_toast">Excluído</string>
     <string name="emulation_savestate_failed_toast">Não foi possível concluir a operação</string>
+    <string name="emulation_savestate_other_version_toast">Este estado salvo foi criado por outra versão do app e não pode ser carregado. O arquivo foi mantido.</string>
+    <string name="emulation_savestate_other_version_boot_toast">O salvamento rápido foi criado por outra versão do app e não pode ser carregado. O jogo será iniciado normalmente; o arquivo foi mantido.</string>
+    <string name="emulation_savestate_vulkan_only">Os estados salvos exigem o renderizador Vulkan</string>
     <string name="emulation_savestate_refused_no_game">Nenhum jogo em execução, não é possível salvar o estado</string>
     <string name="emulation_savestate_refused_exiting">O jogo está sendo fechado, tente novamente mais tarde</string>
     <string name="emulation_savestate_refused_loading">O jogo ainda está carregando, tente novamente em instantes</string>

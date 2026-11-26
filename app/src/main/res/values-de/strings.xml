@@ -257,8 +257,6 @@
     <string name="settings_cpu_pool_size">CPU-Pool-Größe</string>
     <string name="settings_help_cpu_pool_size">Legt fest, wie viele Worker-Threads der Emulator verwendet.\n\nNutze dies, wenn ein Spiel langsam ist, ruckelt oder dein Gerät genug CPU/GPU-Reserve hat. Stelle es zurück, wenn Abstürze, Audioknistern, Hitze, hoher Akkuverbrauch oder falsches Timing auftreten.</string>
     <string name="settings_cpu_pool_size_value">%1$d Worker</string>
-    <string name="settings_hashless_texture_cache">Hash-freier Textur-Cache</string>
-    <string name="settings_help_hashless_texture_cache">Verwendet einen aggressiveren Textur-Cache-Modus.\n\nNutze dies, um Shader- oder Textur-Ruckler nach dem ersten Start zu reduzieren. Deaktiviere es nur bei kaputten Texturen, schwarzem Bildschirm oder reproduzierbaren Abstürzen nach dem Caching.</string>
     <string name="settings_shader_cache">Shader-Cache</string>
     <string name="settings_help_shader_cache">Behält kompilierte Shader zwischen den Durchläufen bei, um Ruckler zu reduzieren.\n\nNutze dies, um Shader- oder Textur-Ruckler nach dem ersten Start zu reduzieren. Deaktiviere es nur bei kaputten Texturen, schwarzem Bildschirm oder reproduzierbaren Abstürzen nach dem Caching.</string>
     <string name="settings_pixel_perfect_fullscreen">Pixelgenauer Vollbildmodus</string>
@@ -1486,6 +1484,9 @@
     <string name="emulation_savestate_loaded_toast">Geladen</string>
     <string name="emulation_savestate_deleted_toast">Gelöscht</string>
     <string name="emulation_savestate_failed_toast">Aktion fehlgeschlagen</string>
+    <string name="emulation_savestate_other_version_toast">Dieser Speicherstand stammt aus einer anderen App-Version und kann nicht geladen werden. Die Datei bleibt erhalten.</string>
+    <string name="emulation_savestate_other_version_boot_toast">Der Schnellspeicherstand stammt aus einer anderen App-Version und kann nicht geladen werden. Das Spiel startet normal; die Datei bleibt erhalten.</string>
+    <string name="emulation_savestate_vulkan_only">Speicherstände benötigen den Vulkan-Renderer</string>
     <string name="emulation_savestate_refused_no_game">Es läuft kein Spiel, der Zustand kann nicht gespeichert werden</string>
     <string name="emulation_savestate_refused_exiting">Das Spiel wird beendet, versuche es später erneut</string>
     <string name="emulation_savestate_refused_loading">Das Spiel lädt noch, versuche es gleich noch einmal</string>

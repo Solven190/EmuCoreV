@@ -71,6 +71,7 @@ enum class GXMState : std::uint16_t {
     FragmentProgramEnable,
     VisibilityBuffer,
     VisibilityIndex,
+    VisibilityIndexBack,
     TotalState
 };
 
@@ -172,6 +173,10 @@ struct Context {
     std::map<int, std::vector<uint8_t>> ubo_data;
 
     shader::Hints shader_hints;
+
+    // sceGxmSetYuvProfile state [program type: 0 = vertex, 1 = fragment][CSC slot]. Resolved when a YUV texture is
+    // bound (set_texture), the profile travels in the command data so replay and save states stay consistent.
+    uint8_t yuv_profile[2][2] = { { 0, 2 }, { 0, 2 } }; // yuv::default_profile
 
     virtual ~Context() = default;
 };

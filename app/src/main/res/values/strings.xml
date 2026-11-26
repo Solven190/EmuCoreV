@@ -550,8 +550,6 @@
     <string name="settings_cpu_pool_size">CPU pool size</string>
     <string name="settings_help_cpu_pool_size">Sets how many worker threads the emulator uses.\n\nUse this when a game is slow, stutters, or your device has enough CPU/GPU headroom to try a faster path. Turn it back off or lower it if you see crashes, audio crackle, overheating, battery drain, or broken timing.</string>
     <string name="settings_cpu_pool_size_value">%1$d workers</string>
-    <string name="settings_hashless_texture_cache">Hashless texture cache</string>
-    <string name="settings_help_hashless_texture_cache">Uses a more aggressive texture cache mode.\n\nUse this to reduce shader or texture stutter after the first run. Disable it only when a game shows corrupted textures, black screens, or repeatable crashes after caching.</string>
     <string name="settings_shader_cache">Shader cache</string>
     <string name="settings_help_shader_cache">Keeps compiled shaders between runs to reduce stutter.\n\nUse this to reduce shader or texture stutter after the first run. Disable it only when a game shows corrupted textures, black screens, or repeatable crashes after caching.</string>
     <string name="settings_pixel_perfect_fullscreen">Pixel perfect fullscreen</string>
@@ -1487,6 +1485,9 @@
     <string name="emulation_savestate_loaded_toast">Loaded</string>
     <string name="emulation_savestate_deleted_toast">Deleted</string>
     <string name="emulation_savestate_failed_toast">Could not complete the operation</string>
+    <string name="emulation_savestate_other_version_toast">This save state was made by a different app version and can\'t be loaded. The file was kept.</string>
+    <string name="emulation_savestate_other_version_boot_toast">The quick save was made by a different app version and can\'t be loaded. Starting the game normally; the file was kept.</string>
+    <string name="emulation_savestate_vulkan_only">Save states need the Vulkan renderer</string>
     <string name="emulation_savestate_refused_no_game">No game is running, so the state cannot be saved</string>
     <string name="emulation_savestate_refused_exiting">The game is closing, try again later</string>
     <string name="emulation_savestate_refused_loading">The game is still loading, try again in a moment</string>

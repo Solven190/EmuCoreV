@@ -71,6 +71,8 @@ struct Framebuffer {
     uint32_t height;
     vkutil::Image *raw_image = nullptr;
     std::shared_ptr<vkutil::Image> shell_fetch_snapshot;
+    // depth-stencil image used by the framebuffer (tracked by the sync tracker around render passes)
+    vkutil::Image *ds_image = nullptr;
 };
 
 struct CastedTexture {
@@ -386,14 +388,31 @@ public:
     void cleanup();
 
     SurfaceRetrieveResult retrieve_color_surface_for_framebuffer(MemState &mem, SceGxmColorSurface *color);
+    // a live colour surface kept in sync with guest memory overlaps [begin, end): the GPU side writes those bytes
+    bool gpu_writes_guest_range(Address begin, Address end) const;
     std::optional<TextureLookupResult> retrieve_color_surface_as_texture(const SceGxmTexture &texture, const SceGxmColorBaseFormat base_format, TextureViewport *texture_viewport);
 
     SurfaceRetrieveResult retrieve_depth_stencil_for_framebuffer(SceGxmDepthStencilSurface *depth_stencil, const uint32_t width, const uint32_t height);
 
+    // B140 (MSAA, src/vulkan/msaa.cpp): read-only lookup of the cached entry of a depth/stencil surface; would_remake tells
+    // whether retrieve_depth_stencil_for_framebuffer would throw the cached image away for this size
+    DepthStencilSurfaceCacheInfo *find_depth_stencil_entry(const SceGxmDepthStencilSurface &depth_stencil, uint32_t width, uint32_t height, bool &would_remake) const;
+    // B140: the next retrieve_depth_stencil_for_framebuffer must not build the sample rate copy (the scene is multisampled)
+    bool msaa_skip_ds_resample = false;
+
     bool begin_ds_scene_depth_check(const SceGxmDepthStencilSurface &depth_stencil, bool this_scene_stores, Address scene_color_addr);
     void resolve_ds_scene_end(bool scene_wrote_depth);
 
+    void observe_sampled_color(vkutil::Image &image);
+    void observe_sampled_depth(vkutil::Image &image);
+    // sync state of the guest memory mirror buffers the surface write-back copies into (keyed by VkBuffer)
+    std::unordered_map<uint64_t, vkutil::sync::State> mirror_buffer_sync;
     bool try_transfer_depth_gpu(Address src_address, Address dst_address, uint32_t width, uint32_t height);
+
+    // sceGxmTransferCopy / Downscale / Fill between cached colour surfaces as image blits and clears (P12). Returns false when
+    // the transfer is not exactly expressible (the caller then runs the exact CPU transfer).
+    enum class ColorTransferKind { Copy, Downscale, Fill };
+    bool try_transfer_color_gpu(MemState &mem, ColorTransferKind kind, const SceGxmTransferImage &src, const SceGxmTransferImage &dst, SceGxmTransferType src_type, SceGxmTransferType dst_type, uint32_t fill_color);
 
     void perform_pending_casts(VKContext &context, uint16_t vert_texture_count, uint16_t frag_texture_count);
     void flush_all_pending_casts();
@@ -423,6 +442,7 @@ public:
     // fill): flag every cached color surface overlapping it dirty so its next use re-uploads the
     // guest content. Works even where memory protection cannot trap the write.
     void mark_guest_range_written(Address first, Address end);
+    ColorSurfaceCacheInfo *find_transfer_surface(MemState &mem, Address address);
     // Called when a guest address is about to be read by the GPU through raw buffer
     // accesses (e.g. a uniform buffer aliasing a rendered surface, like Killzone Mercenary's
     // bloom chain reading its HDR render target). If the address lies inside a

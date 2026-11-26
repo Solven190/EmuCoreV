@@ -152,6 +152,7 @@ void set_uniform_buffer(VKContext &context, MemState &mem, const ShaderProgram *
             }
 
             context.vertex_uniform_stream_ring_buffer.copy(context.prerender_cmd, data_size_upload, data.get(mem), offset_start_upload);
+            buffer_store::note_block(context.draw_store_blocks, { data.address(), data_size_upload, offset_start_upload, 0, buffer_store::Vertex, block_num });
         } else {
             if (!context.fragment_uniform_storage_allocated) {
                 // Allocate a region for it. Don't worry though, when the shader program is changed
@@ -160,6 +161,7 @@ void set_uniform_buffer(VKContext &context, MemState &mem, const ShaderProgram *
             }
 
             context.fragment_uniform_stream_ring_buffer.copy(context.prerender_cmd, data_size_upload, data.get(mem), offset_start_upload);
+            buffer_store::note_block(context.draw_store_blocks, { data.address(), data_size_upload, offset_start_upload, 0, buffer_store::Fragment, block_num });
         }
     }
 }
@@ -182,12 +184,13 @@ void mid_scene_flush(VKContext &context, const SceGxmNotification notification) 
         context.stop_render_pass();
 
     // in case there is no notification, this will happen in the render pass
-    vk::MemoryBarrier barrier{
-        .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
-        .dstAccessMask = vk::AccessFlagBits::eVertexAttributeRead,
-    };
-    context.render_cmd.pipelineBarrier(vk::PipelineStageFlagBits::eVertexShader, vk::PipelineStageFlagBits::eVertexInput,
-        vk::DependencyFlags(), barrier, {}, {});
+    {
+        // shader stores through device addresses cannot be attributed to a tracked buffer: explicit global dependency
+        vkutil::sync::Batch batch;
+        batch.global(vkutil::sync::S::eVertexShader, vkutil::sync::A::eShaderWrite,
+            vkutil::sync::S::eVertexInput, vkutil::sync::A::eVertexAttributeRead);
+        batch.flush(context.render_cmd);
+    }
 
     if (restart_render_pass) {
         SceGxmNotification empty_notification = { Ptr<uint32_t>(0), 0 };
@@ -446,6 +449,36 @@ static bool bind_vertex_streams(VKContext &context, MemState &mem, uint32_t inst
     return true;
 }
 
+// Begin or end the occlusion query so that the next draw counts into the entry of the face it hits (P8). Every activation
+// takes a fresh slot of the pool: a slot must not be begun twice between resets, and the CPU adds the slots of an entry up.
+static void activate_visibility(VKContext &context, const bool is_back) {
+    VisibilityBuffer *buffer = context.current_visibility_buffer;
+    const visibility::Face front{ context.current_query_idx, context.is_query_op_increment };
+    const visibility::Face back{ context.back_query_idx, context.back_query_op_increment };
+    const visibility::Face &face = visibility::effective_face(front, back, is_back, context.record.two_sided == SCE_GXM_TWO_SIDED_ENABLED);
+    const bool wanted = buffer != nullptr && face.enabled();
+
+    if (context.is_in_query && (!wanted || !(context.running_query_face == face))) {
+        context.render_cmd.endQuery(buffer->query_pool, context.running_query_slot);
+        context.is_in_query = false;
+    }
+    if (!wanted || context.is_in_query)
+        return;
+
+    const int32_t slot = buffer->scene.begin(static_cast<uint32_t>(face.index), face.increment, buffer->size, buffer->pool_size);
+    if (slot < 0) {
+        LOG_WARN_ONCE("Visibility entry {} is outside the buffer ({} entries) or the query pool is exhausted: not counted", face.index, buffer->size);
+        return;
+    }
+    context.visibility_max_used_idx = slot;
+    const vk::QueryControlFlags control_flags = (face.increment && context.state.gpu_caps.occlusion_query_precise) ? vk::QueryControlFlagBits::ePrecise : vk::QueryControlFlags();
+    context.render_cmd.beginQuery(buffer->query_pool, static_cast<uint32_t>(slot), control_flags);
+    context.is_in_query = true;
+    context.instance_queries++;
+    context.running_query_face = face;
+    context.running_query_slot = slot;
+}
+
 void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format,
     Ptr<void> indices, size_t count, uint32_t instance_count, MemState &mem, const Config &config) {
 #if ECV_ORACLE
@@ -525,11 +558,21 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
             context.draw_rect_y0 = std::min(context.draw_rect_y0, y0);
             context.draw_rect_x1 = std::max(context.draw_rect_x1, x1);
             context.draw_rect_y1 = std::max(context.draw_rect_y1, y1);
+            context.inst_rect.add({ x0, y0, x1, y1 });
         }
     }
     context.scene_has_drawn = true;
 
     context.check_for_macroblock_change(true);
+
+    // B140 test hook (debug builds): end the multisampled pass instance before its 4th draw so the restart path runs
+    if (context.in_renderpass && msaa::debug_force_restart(context)) {
+        const auto scene_dyn_pass = context.dyn_pass;
+        context.dyn_pass.depth_load = context.dyn_pass.stencil_load = true;
+        context.stop_render_pass();
+        context.start_render_pass();
+        context.dyn_pass = scene_dyn_pass;
+    }
 
     if (!context.in_renderpass)
         context.start_render_pass();
@@ -538,9 +581,8 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
     // multi-pass, or a mid-scene interruption such as a casted-texture copy), the re-begin
     // must load the depth-stencil, never re-run the scene-begin clear
     if (context.is_first_scene_draw && (context.state.features.support_shader_interlock || context.ignore_macroblock || !context.render_target->has_macroblock_sync)) {
-        // update the render pass to load and store the depth and stencil
-        context.current_render_pass = context.state.pipeline_cache.retrieve_render_pass(context.current_color_format, true, true, true, !context.record.color_surface.data, false,
-            context.record.color_base_format == SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16, context.ds_host_format);
+        // the following instances load the depth and stencil
+        context.dyn_pass.depth_load = context.dyn_pass.stencil_load = true;
 #if ECV_ORACLE
         if (ecv::oracle::gpu::enabled())
             ecv::oracle::gpu::rp_loads(reinterpret_cast<uint64_t>(static_cast<VkRenderPass>(context.current_render_pass)), "first_draw_upgrade");
@@ -557,12 +599,16 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
             return;
     }
 #endif
-    if (context.shell_fetch_snapshot && fragment_program_gxp.is_frag_color_used()) {
+    if (context.shell_fetch_snapshot && !context.ms_scene.active && fragment_program_gxp.is_frag_color_used()) {
 #if ECV_ORACLE
     ecv::oracle::gpu::rp_reason("shell_fetch_snapshot");
 #endif
         // PAF's glow must sample completed pixels, not a simultaneous write to
         // the same attachment on a non-coherent mobile framebuffer-fetch path.
+        // The instance that follows the copy continues the scene: it loads the depth-stencil (the scene-begin clear must not run again; a
+        // macroblock scene keeps its clear for the next macroblock, so the ops are restored afterwards).
+        const auto scene_dyn_pass = context.dyn_pass;
+        context.dyn_pass.depth_load = context.dyn_pass.stencil_load = true;
         context.stop_render_pass();
         auto &source = *context.current_color_base_image;
         auto &snapshot = *context.shell_fetch_snapshot;
@@ -575,15 +621,19 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
         };
         context.render_cmd.copyImage(source.image, vk::ImageLayout::eTransferSrcOptimal,
             snapshot.image, vk::ImageLayout::eTransferDstOptimal, region);
-        source.transition_to(context.render_cmd, vkutil::ImageLayout::ColorAttachmentReadWrite);
-        snapshot.transition_to(context.render_cmd, vkutil::ImageLayout::StorageImage);
-        vk::MemoryBarrier ready{
-            .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-            .dstAccessMask = vk::AccessFlagBits::eInputAttachmentRead
-        };
-        context.render_cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-            vk::PipelineStageFlagBits::eFragmentShader, {}, ready, {}, {});
+        {
+            // back to the attachment layout; the snapshot becomes the pass' input attachment
+            vkutil::sync::Batch batch;
+            source.use(batch, vkutil::sync::S::eColorAttachmentOutput, vkutil::sync::A::eColorAttachmentRead | vkutil::sync::A::eColorAttachmentWrite,
+                vk::ImageLayout::eGeneral);
+            snapshot.use(batch, vkutil::sync::S::eFragmentShader, vkutil::sync::A::eInputAttachmentRead | vkutil::sync::A::eShaderRead,
+                vk::ImageLayout::eGeneral);
+            batch.flush(context.render_cmd);
+            source.layout = vkutil::ImageLayout::ColorAttachmentReadWrite;
+            snapshot.layout = vkutil::ImageLayout::StorageImage;
+        }
         context.start_render_pass();
+        context.dyn_pass = scene_dyn_pass;
     }
 
     if (context.state.features.preserve_f16_nan_as_u16) {
@@ -597,12 +647,11 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
         // at start-up by gpu_caps_selftest.h, never guessed from a vendor name): restart the instance (attachments stored, then loaded again).
         // The restarted instance must load the depth-stencil (the scene-begin clear must not run twice) without changing the scene's render
         // pass for the instances that follow (a macroblock change still starts from the scene-begin clear).
-        const vk::RenderPass scene_render_pass = context.current_render_pass;
-        context.current_render_pass = context.state.pipeline_cache.retrieve_render_pass(context.current_color_format, true, true, true, !context.record.color_surface.data, false,
-            context.record.color_base_format == SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16);
+        const auto scene_dyn_pass = context.dyn_pass;
+        context.dyn_pass.depth_load = context.dyn_pass.stencil_load = true;
         context.stop_render_pass();
         context.start_render_pass();
-        context.current_render_pass = scene_render_pass;
+        context.dyn_pass = scene_dyn_pass;
     }
     context.prev_draw_fbfetch = context.state.features.direct_fragcolor && fragment_program_gxp.is_frag_color_used();
 #if ECV_ORACLE
@@ -615,58 +664,40 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
 #endif
     if (context.state.features.direct_fragcolor && fragment_program_gxp.is_frag_color_used()) {
         // the fragment shader is using programmable blending with a subpass input
-        vk::ImageMemoryBarrier barrier{
-            .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-            .dstAccessMask = vk::AccessFlagBits::eInputAttachmentRead,
-            .oldLayout = vk::ImageLayout::eGeneral,
-            .newLayout = vk::ImageLayout::eGeneral,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = context.current_color_base_image->image,
-            .subresourceRange = vkutil::color_subresource_range
-        };
-        std::array<vk::ImageMemoryBarrier, 2> barriers = { barrier, barrier };
-        const uint32_t barrier_count = context.current_color_raw_image ? 2 : 1;
-        if (context.current_color_raw_image)
-            barriers[1].image = context.current_color_raw_image->image;
+        {
+            // render pass self-dependency (dependencies[3] in pipeline_cache.cpp): pixels written by earlier draws -> input attachment read.
+            // Recorded inside the pass, so it is an explicit by-region barrier and does not change the tracked image state.
+            namespace sync = vkutil::sync;
+            const sync::Barrier self_dep{ sync::S::eColorAttachmentOutput, sync::S::eFragmentShader, sync::A::eColorAttachmentWrite,
+                sync::A::eInputAttachmentRead, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral, true };
+            sync::Batch batch;
+            batch.set_by_region(true);
+            const bool ms = context.ms_scene.active;
+            batch.explicit_image(ms ? context.ms_scene.color_ms->image : context.current_color_base_image->image, vkutil::color_subresource_range, self_dep);
+            if (ms ? context.ms_scene.raw_ms != nullptr : context.current_color_raw_image != nullptr)
+                batch.explicit_image(ms ? context.ms_scene.raw_ms->image : context.current_color_raw_image->image, vkutil::color_subresource_range, self_dep);
 #if ECV_ORACLE
-        if (ecv::oracle::gpu::dbg(ecv::oracle::gpu::DBG_FB_NOBARRIER)) {
-        } else if (ecv::oracle::gpu::dbg(ecv::oracle::gpu::DBG_FB_NOREGION)) {
-            context.render_cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput, vk::PipelineStageFlagBits::eFragmentShader,
-                vk::DependencyFlags(), {}, {}, vk::ArrayProxy<const vk::ImageMemoryBarrier>(barrier_count, barriers.data()));
-        } else
+            if (ecv::oracle::gpu::dbg(ecv::oracle::gpu::DBG_FB_NOBARRIER)) {
+                // debug A/B: no barrier at all (batch dropped)
+            } else {
+                if (ecv::oracle::gpu::dbg(ecv::oracle::gpu::DBG_FB_NOREGION))
+                    batch.set_by_region(false);
+                batch.flush(context.render_cmd);
+            }
+#else
+            batch.flush(context.render_cmd);
 #endif
-        context.render_cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput, vk::PipelineStageFlagBits::eFragmentShader,
-            vk::DependencyFlagBits::eByRegion, {}, {}, vk::ArrayProxy<const vk::ImageMemoryBarrier>(barrier_count, barriers.data()));
+        }
     } else if (context.state.features.support_shader_interlock
         && fragment_program_gxp.is_frag_color_used() != context.last_draw_was_framebuffer_fetch) {
-        // restart the render pass to act as a barrier
-        context.render_cmd.endRenderPass();
-
-        if (fragment_program_gxp.is_frag_color_used()) {
-            context.curr_renderpass_info.framebuffer = context.current_shader_interlock_framebuffer;
-            context.curr_renderpass_info.renderPass = context.current_shader_interlock_pass;
-        } else {
-            context.curr_renderpass_info.framebuffer = context.current_framebuffer;
-            context.curr_renderpass_info.renderPass = context.current_render_pass;
-        }
-
-        context.render_cmd.beginRenderPass(context.curr_renderpass_info, vk::SubpassContents::eInline);
+        // restart the render pass to act as a barrier, in the other pass variant (the restarted instance loads the depth stencil)
+        const auto scene_dyn_pass = context.dyn_pass;
+        context.dyn_pass.depth_load = context.dyn_pass.stencil_load = true;
+        context.stop_render_pass();
+        context.interlock_pass_active = fragment_program_gxp.is_frag_color_used();
+        context.start_render_pass(false);
+        context.dyn_pass = scene_dyn_pass;
         context.last_draw_was_framebuffer_fetch = fragment_program_gxp.is_frag_color_used();
-    }
-
-    if (context.current_visibility_buffer != nullptr && context.current_query_idx != -1 && !context.is_in_query) {
-        if (context.current_visibility_buffer->queries_used[context.current_query_idx]) {
-            LOG_WARN_ONCE("Visibility buffer entry is used more than once in a scene");
-            // still let this happen, this is a validation error but I think most GPUs should be fine with it
-        }
-        context.current_visibility_buffer->queries_used[context.current_query_idx] = true;
-
-        context.visibility_max_used_idx = std::max(context.visibility_max_used_idx, context.current_query_idx);
-
-        const vk::QueryControlFlags control_flags = (context.is_query_op_increment && context.state.physical_device_features.occlusionQueryPrecise) ? vk::QueryControlFlagBits::ePrecise : vk::QueryControlFlags();
-        context.render_cmd.beginQuery(context.current_visibility_buffer->query_pool, context.current_query_idx, control_flags);
-        context.is_in_query = true;
     }
 
     // do we need to check for a pipeline change?
@@ -681,10 +712,13 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
         // The Vita uses the front or the back depth state of the face a primitive hits. Vulkan can not do that per face (stencil
         // aside): if the guest gives the faces different state, draw once per facing with the other facing culled.
         const GxmRecordState &rec = context.record;
+        // a different visibility state per face also needs one draw per facing (only when a visibility buffer is in use)
+        const visibility::Face query_front = context.current_visibility_buffer ? visibility::Face{ context.current_query_idx, context.is_query_op_increment } : visibility::Face{};
+        const visibility::Face query_back = context.current_visibility_buffer ? visibility::Face{ context.back_query_idx, context.back_query_op_increment } : visibility::Face{};
         const dsmodel::FaceState front_face{ rec.front_depth_func, rec.front_depth_write_mode, rec.front_polygon_mode,
-            rec.front_side_fragment_program_mode, dsmodel::DepthBias{ rec.depth_bias_slope, rec.depth_bias_unit } };
+            rec.front_side_fragment_program_mode, dsmodel::DepthBias{ rec.depth_bias_slope, rec.depth_bias_unit }, query_front };
         const dsmodel::FaceState back_face{ rec.back_depth_func, rec.back_depth_write_mode, rec.back_polygon_mode,
-            rec.back_side_fragment_program_mode, context.depth_bias.back };
+            rec.back_side_fragment_program_mode, context.depth_bias.back, query_back };
         const dsmodel::FacePlan plan = dsmodel::plan_faces(rec.two_sided == SCE_GXM_TWO_SIDED_ENABLED, rec.cull_mode, front_face, back_face);
         const dsmodel::PassList passes = dsmodel::passes_for(plan);
         if (plan == dsmodel::FacePlan::Split)
@@ -699,6 +733,8 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
                 new_pipeline = nullptr;
         }
         context.face_plan = plan;
+        context.draw_variant[0] = passes.variant[0];
+        context.draw_variant[1] = passes.variant[1];
         context.split_pipeline = new_split;
 
         if (new_pipeline != context.current_pipeline) {
@@ -772,6 +808,8 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
     vert_ublock.viewport_flag = (context.record.viewport_flat) ? 0.0f : 1.0f;
     vert_ublock.z_offset = context.record.z_offset;
     vert_ublock.z_scale = context.record.z_scale;
+    vert_ublock.point_size = raster::point_size(context.record.line_width, context.state.res_multiplier, context.state.gpu_caps.large_points,
+        context.state.gpu_caps.max_point_size);
     vert_ublock.screen_width = context.render_target->width / context.state.res_multiplier;
     vert_ublock.screen_height = context.render_target->height / context.state.res_multiplier;
 
@@ -785,6 +823,10 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
     auto &frag_ublock = context.curr_frag_ublock.base_block;
     frag_ublock.writing_mask = context.record.writing_mask;
     frag_ublock.res_multiplier = context.state.res_multiplier;
+    frag_ublock.dither_enabled = context.record.color_surface.dither ? 1.0f : 0.0f;
+    const raster::PointUvFlip point_flip = raster::point_uv_flip(context.record.front_polygon_mode);
+    frag_ublock.point_flip_u = point_flip.flip_u ? 1.0f : 0.0f;
+    frag_ublock.point_flip_v = point_flip.flip_v ? 1.0f : 0.0f;
     frag_ublock.use_raw_image = (context.state.features.preserve_f16_nan_as_u16
                                     && context.record.color_base_format == SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16
                                     && context.state.surface_cache.current_surface_raw_is_valid())
@@ -864,22 +906,74 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
 
     // bind the vertex streams
     if (!bind_vertex_streams(context, mem, instance_count, max_index)) {
+        context.draw_store_blocks.clear();
         context.vertex_uniform_storage_allocated = false;
         context.fragment_uniform_storage_allocated = false;
         return;
     }
 
-    apply_depth_bias(context, context.face_plan == dsmodel::FacePlan::Back);
-    context.render_cmd.drawIndexed(count, instance_count, 0, 0, 0);
-
-    if (context.split_pipeline != nullptr) {
-        // second facing: its own pipeline and bias, then bind the first pipeline back (the draw loop assumes it is bound)
-        apply_depth_bias(context, true);
-        context.render_cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, context.split_pipeline);
+    const auto set_cull = [&](dsmodel::PassVariant variant) {
+        if (!context.state.use_extended_dynamic_state)
+            return;
+        const vk::CullModeFlags mode = PipelineCache::draw_cull_mode(context.record.cull_mode, variant);
+        if (!context.applied_cull_valid || context.applied_cull != mode) {
+            context.render_cmd.setCullModeEXT(mode);
+            context.applied_cull = mode;
+            context.applied_cull_valid = true;
+        }
+    };
+    const auto draw_faces = [&]() {
+        apply_depth_bias(context, context.face_plan == dsmodel::FacePlan::Back);
+        activate_visibility(context, context.face_plan == dsmodel::FacePlan::Back);
+        context.instance_draws++;
+        set_cull(context.draw_variant[0]);
         context.render_cmd.drawIndexed(count, instance_count, 0, 0, 0);
-        context.render_cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, context.current_pipeline);
-    }
 
+        if (context.split_pipeline != nullptr) {
+            // second facing: its own pipeline and bias, then bind the first pipeline back (the draw loop assumes it is bound)
+            apply_depth_bias(context, true);
+            activate_visibility(context, true);
+            context.render_cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, context.split_pipeline);
+            set_cull(context.draw_variant[1]);
+            context.instance_draws++;
+            context.render_cmd.drawIndexed(count, instance_count, 0, 0, 0);
+            context.render_cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, context.current_pipeline);
+        }
+    };
+
+    // Lines wider than one pixel on a device without wideLines: repeat the draw shifted by sub-pixel steps (raster::line_brush)
+    std::vector<raster::Offset> brush;
+    const float line_pixels = static_cast<float>(context.record.line_width) * context.state.res_multiplier;
+    if (type == SCE_GXM_PRIMITIVE_LINES && !context.state.gpu_caps.wide_lines && line_pixels > 1.0f) {
+        brush = raster::line_brush(line_pixels);
+        LOG_INFO_ONCE("Wide lines without the wideLines feature: drawn as a brush of {} shifted lines", brush.size());
+    }
+    // Region clip INSIDE: one draw per rectangle of the target outside the region
+    const bool clip_inside = context.record.region_clip_mode == SCE_GXM_REGION_CLIP_INSIDE;
+    const uint32_t strip_count = clip_inside ? context.inside_clip.count : 1;
+
+    for (uint32_t strip = 0; strip < strip_count; strip++) {
+        if (clip_inside) {
+            const raster::Rect &r = context.inside_clip.rect[strip];
+            context.render_cmd.setScissor(0, vk::Rect2D{ { r.x, r.y }, { r.w, r.h } });
+        }
+        if (brush.empty()) {
+            draw_faces();
+        } else {
+            for (const raster::Offset &offset : brush) {
+                vk::Viewport shifted = context.viewport;
+                shifted.x += offset.x;
+                shifted.y += offset.y;
+                context.render_cmd.setViewport(0, shifted);
+                draw_faces();
+            }
+            context.render_cmd.setViewport(0, context.viewport);
+        }
+    }
+    if (clip_inside)
+        context.render_cmd.setScissor(0, context.scissor);
+
+    context.collect_buffer_stores(mem);
     context.vertex_uniform_storage_allocated = false;
     context.fragment_uniform_storage_allocated = false;
 }

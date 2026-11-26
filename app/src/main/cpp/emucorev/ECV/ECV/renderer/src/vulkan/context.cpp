@@ -21,19 +21,28 @@
 #include <renderer/vulkan/context_snapshot.h>
 #include <renderer/vulkan/depth_clear.h>
 #include <renderer/vulkan/gxm_to_vulkan.h>
+#include <renderer/vulkan/render_pass_sync.h>
+#include <renderer/vulkan/render_pass_policy.h>
 #include <renderer/vulkan/state.h>
 #include <renderer/vulkan/surface_sync.h>
 
 #include <cpu/functions.h>
 #include <gxm/functions.h>
+#include <mem/functions.h>
 #include <renderer/functions.h>
 
 #include <util/log.h>
 #include <util/overloaded.h>
 #include <renderer/vulkan/gpu_resource_cleanup.h>
 
+#if ECV_ORACLE
+#include <ecv_frame_capture.h> // oracle: GXM frame capture (debug builds only)
+#endif
+
 #include <algorithm>
 #include <limits>
+#include <memory>
+#include <shared_mutex>
 
 #if ECV_ORACLE
 #include <ecv_gpu_trace.h>
@@ -42,6 +51,24 @@
 #endif
 
 namespace renderer::vulkan {
+
+// The GPU has finished the scene: add the slot results up per entry and write the entries into the guest buffer.
+// The same path with and without memory mapping (no copy into mapped memory is needed).
+static void resolve_visibility(const MemState &mem, VisibilityResolve &resolve) {
+    const auto values = visibility::resolve(resolve.activations, static_cast<const uint32_t *>(resolve.staging.mapped_data));
+    {
+        const std::shared_lock<std::shared_mutex> transition_lock(mem.external_transition_mutex);
+        renderer::vulkan::surface_sync_internal_write = true;
+        for (const visibility::EntryValue &v : values) {
+            const uint64_t address = static_cast<uint64_t>(resolve.address) + static_cast<uint64_t>(v.entry) * sizeof(uint32_t);
+            if (address + sizeof(uint32_t) > std::numeric_limits<Address>::max() || !is_valid_addr_range(mem, static_cast<Address>(address), static_cast<Address>(address + sizeof(uint32_t))))
+                continue;
+            *Ptr<uint32_t>(static_cast<Address>(address)).get(mem) = v.value;
+        }
+        renderer::vulkan::surface_sync_internal_write = false;
+    }
+    resolve.staging.destroy();
+}
 
 void VKContext::wait_thread_function(const MemState &mem) {
     const ActiveGpuRequestReader active_reader(state.gpu_request_reader_count);
@@ -64,19 +91,32 @@ void VKContext::wait_thread_function(const MemState &mem) {
 void VKContext::wait_thread_body(const MemState &mem) {
     // try to wait for multiple fences at the same time if possible
     std::vector<vk::Fence> fences;
+    // timeline tracking: the highest value requested since the last wait (one semaphore wait replaces the whole fence list)
+    uint64_t timeline_target = 0;
+    bool timeline_mixed = false;
 
     auto wait_for_fences = [&]() {
         while (!fences.empty()) {
             // timeout so we can check for shutdown
-            auto result = state.device.waitForFences(fences, VK_TRUE, 100'000'000ULL);
+            vk::Result result;
+            if (timeline_target != 0 && state.submit_timeline) {
+                const vk::SemaphoreWaitInfo wait_info{ .semaphoreCount = 1, .pSemaphores = &state.submit_timeline, .pValues = &timeline_target };
+                result = state.device.waitSemaphoresKHR(wait_info, 100'000'000ULL);
+            } else {
+                result = state.device.waitForFences(fences, VK_TRUE, 100'000'000ULL);
+            }
             if (result == vk::Result::eSuccess) {
                 // don't reset them
                 fences.clear();
+                timeline_target = 0;
+                timeline_mixed = false;
                 break;
             }
             if (result == vk::Result::eTimeout) {
                 if (state.request_queue.is_aborted()) {
                     fences.clear();
+                    timeline_target = 0;
+                    timeline_mixed = false;
                     break;
                 }
                 continue;
@@ -85,6 +125,8 @@ void VKContext::wait_thread_body(const MemState &mem) {
             // let the caller signal syncs/notifications as completed: unwind to wait_thread_function.
             LOG_ERROR("Could not wait for fences: {}", vk::to_string(result));
             fences.clear();
+            timeline_target = 0;
+            timeline_mixed = false;
             throw vk::SystemError(vk::make_error_code(result), "waitForFences");
         }
     };
@@ -98,6 +140,11 @@ void VKContext::wait_thread_body(const MemState &mem) {
         std::visit(overloaded{
                        [&](FenceWaitRequest &request) {
                            fences.push_back(request.fence);
+                           // a request without a value (early submits) forces the fence wait for the whole list
+                           if (request.timeline_value == 0)
+                               timeline_target = 0, timeline_mixed = true;
+                           else if (!timeline_mixed)
+                               timeline_target = std::max(timeline_target, request.timeline_value);
                        },
                        [&](NotificationRequest &request) {
                            if (request.notifications[0].address || request.notifications[1].address) {
@@ -147,6 +194,9 @@ void VKContext::wait_thread_body(const MemState &mem) {
                            src += mapping_offset;
                            uint8_t *dst = reinterpret_cast<uint8_t *>(Ptr<void>(request.location).get(mem));
                            renderer::vulkan::surface_sync_internal_write = true;
+#if ECV_ORACLE
+                           ecv::oracle::fcap::note_memory_write(request.location, request.size, true);
+#endif
                            bool copied = true;
                            if (request.row_stride != 0) {
                                copied = copy_surface_sync_rows(dst, request.size, src,
@@ -163,10 +213,17 @@ void VKContext::wait_thread_body(const MemState &mem) {
                            if (!copied)
                                LOG_ERROR("Invalid row layout in Buffer Sync request at {}", log_hex(request.location));
                        },
+                       [&](VisibilityResolveRequest &request) {
+                           wait_for_fences();
+                           resolve_visibility(mem, *request.resolve);
+                       },
                        [&](PostSurfaceSyncRequest &request) {
                            wait_for_fences();
                            const std::shared_lock<std::shared_mutex> transition_lock(mem.external_transition_mutex);
                            renderer::vulkan::surface_sync_internal_write = true;
+#if ECV_ORACLE
+                           ecv::oracle::fcap::note_memory_write(request.cache_info->data.address(), request.cache_info->total_bytes, true);
+#endif
                            state.surface_cache.perform_post_surface_sync(mem, request.cache_info);
                            renderer::vulkan::surface_sync_internal_write = false;
                        },
@@ -248,10 +305,12 @@ static void configure_context_scene(VKContext &context, MemState &mem, VKRenderT
     SceGxmColorSurface *color_surface_fin = &context.record.color_surface;
     // set these values for the pipeline cache
     context.record.color_base_format = gxm::get_base_format(color_surface_fin->colorFormat);
-    context.record.is_gamma_corrected = static_cast<bool>(color_surface_fin->gamma);
-    vk::Format vk_format = color::translate_surface_format(context.record.color_base_format);
+    // the gamma bit only means something on the formats colourmodel::gamma_applies names
+    context.record.is_gamma_corrected = static_cast<bool>(color_surface_fin->gamma) && colourmodel::gamma_applies(context.record.color_base_format);
+    const auto colour_entry = context.state.colour_entry(context.record.color_base_format);
+    vk::Format vk_format = colour_entry ? colour_entry->format : color::translate_surface_format(context.record.color_base_format);
 
-    if (color_surface_fin->gamma && vk_format == vk::Format::eR8G8B8A8Unorm) {
+    if (context.record.is_gamma_corrected && vk_format == vk::Format::eR8G8B8A8Unorm) {
         vk_format = vk::Format::eR8G8B8A8Srgb;
     }
 
@@ -344,7 +403,8 @@ static void configure_context_scene(VKContext &context, MemState &mem, VKRenderT
     VKState &state = context.state;
     state.surface_cache.set_render_target(rt);
 
-    context.start_recording(!restoring);
+    if (!context.is_recording)
+        context.start_recording(!restoring); // a depth transfer between scenes may already have opened it
 
     bool force_load = context.record.depth_stencil_surface.force_load;
     bool force_store = context.record.depth_stencil_surface.force_store;
@@ -353,9 +413,10 @@ static void configure_context_scene(VKContext &context, MemState &mem, VKRenderT
         force_load = false;
         force_store = false;
     }
-    // GXM force_store controls write-back to the depth surface memory, not whether the buffer keeps its contents
-    force_store = true;
-
+    // GXM force_store controls write-back to the depth surface memory, not whether the buffer keeps its contents. The store is derived
+    // (render_pass_policy.h): dropped only when the depth is provably dead. A scene may restart its pass and LOAD what the first instance
+    // stored (mid-scene flush, casts, fbfetch restarts, depth transfers), and that is not known when the scene begins, so today the
+    // answer is always "store" unless a producer of "this scene cannot restart" exists.
 #if ECV_ORACLE
     bool oracle_depth_valid = true;
 #endif
@@ -372,14 +433,38 @@ static void configure_context_scene(VKContext &context, MemState &mem, VKRenderT
             depth_load = false;
     }
     const bool color_has_raw = context.record.color_base_format == SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16;
-    context.current_render_pass = context.state.pipeline_cache.retrieve_render_pass(vk_format, depth_load, stencil_load, force_store, color_surface_fin == nullptr, false, color_has_raw, context.ds_host_format);
+    // what the pass instances of this scene begin with; the store and a content-based load are decided when an instance ends (emit_pass)
+    context.dyn_pass.has_raw = color_has_raw && color_surface_fin != nullptr && state.features.preserve_f16_nan_as_u16 && vk_format == vk::Format::eR16G16B16A16Sfloat;
+    context.dyn_pass.depth_load = depth_load;
+    context.dyn_pass.stencil_load = stencil_load;
+    context.dyn_pass.guest_store = ds_surface_fin != nullptr && context.record.depth_stencil_surface.force_store;
+    context.interlock_pass_active = false;
+    // B140: decide whether the scene is rasterised with real multisampling before the framebuffer is built
+    MsaaPlan msaa_plan;
+    context.ms_scene = MsaaScene{};
+    if (!restoring) {
+        msaa_plan = msaa::plan(context, *rt, restoring, color_surface_fin != nullptr, vk_format, color_has_raw, msaa_expanded,
+            ds_surface_fin, depth_load, context.record.depth_stencil_surface.force_load, context.record.depth_stencil_surface.force_store);
+        // a multisampled scene never reads the sample rate copy of the depth/stencil surface
+        state.surface_cache.msaa_skip_ds_resample = msaa_plan.use;
+    }
+    // the pass pipelines and secondary command buffers are created against (any compatible variant)
+    context.current_render_pass = state.use_dynamic_rendering ? vk::RenderPass{}
+        : context.state.pipeline_cache.retrieve_render_pass(vk_format, true, true, true, color_surface_fin == nullptr, false, color_has_raw, context.ds_host_format);
+    context.scene_pass_starts = 0;
+    context.scene_depth_unbacked = ds_surface_fin == nullptr;
+    if (!restoring) {
+        vkutil::sync::stats().scenes++;
+        if (context.scene_depth_unbacked)
+            vkutil::sync::stats().scenes_depth_unbacked++;
+    }
 #if ECV_ORACLE
     if (ecv::oracle::gpu::enabled())
         ecv::oracle::gpu::scene_cfg(restoring, context.record.depth_stencil_surface.force_load, context.record.depth_stencil_surface.force_store,
             oracle_depth_valid, depth_load, stencil_load, ds_surface_fin ? ds_surface_fin->depth_data.address() : 0,
             ds_surface_fin ? ds_surface_fin->stencil_data.address() : 0, reinterpret_cast<uint64_t>(static_cast<VkRenderPass>(context.current_render_pass)));
 #endif
-    if (context.state.features.support_shader_interlock)
+    if (context.state.features.support_shader_interlock && !state.use_dynamic_rendering)
         // also retrieve / create the shader interlock pass
         context.current_shader_interlock_pass = context.state.pipeline_cache.retrieve_render_pass(vk_format, true, true, true, color_surface_fin == nullptr, true, false, context.ds_host_format);
 
@@ -387,11 +472,18 @@ static void configure_context_scene(VKContext &context, MemState &mem, VKRenderT
     context.current_framebuffer = framebuffer.standard;
     context.current_shader_interlock_framebuffer = framebuffer.shader_interlock;
     context.current_color_base_image = framebuffer.base_image;
+    context.current_ds_image = framebuffer.ds_image;
+    context.current_color_loaded = color_surface_fin != nullptr;
     context.current_fb_width = framebuffer.width;
     context.current_fb_height = framebuffer.height;
     context.current_color_raw_view = framebuffer.raw_image ? framebuffer.raw_image->view : state.default_raw_image.view;
     context.current_color_raw_image = framebuffer.raw_image;
     context.shell_fetch_snapshot = framebuffer.shell_fetch_snapshot.get();
+    state.surface_cache.msaa_skip_ds_resample = false;
+    if (msaa_plan.use)
+        msaa::activate(context, msaa_plan, context.current_color_view, context.current_ds_view, framebuffer.width, framebuffer.height);
+    else if (!restoring)
+        msaa::note_single_sample_scene(context, ds_surface_fin);
 
     // make sure we are not keeping any texture from the previous pass
     // (textures can be still bound even though they are not used)
@@ -423,6 +515,9 @@ static void configure_context_scene(VKContext &context, MemState &mem, VKRenderT
         sync_visibility_index(context, resume->visibility_query_index >= 0,
             resume->visibility_query_index >= 0 ? static_cast<uint32_t>(resume->visibility_query_index) : 0,
             resume->visibility_query_increment);
+        sync_visibility_index_back(context, resume->visibility_back_query_index >= 0,
+            resume->visibility_back_query_index >= 0 ? static_cast<uint32_t>(resume->visibility_back_query_index) : 0,
+            resume->visibility_back_query_increment);
     }
 }
 
@@ -582,10 +677,7 @@ void VKContext::start_render_pass(bool create_descriptor_set) {
     if (!is_recording)
         start_recording();
 
-    curr_renderpass_info = vk::RenderPassBeginInfo{
-        .renderPass = current_render_pass,
-        .framebuffer = current_framebuffer
-    };
+    curr_renderpass_info = vk::RenderPassBeginInfo{};
 
     if (render_target->has_macroblock_sync && !ignore_macroblock) {
         // set the render area to the correct macroblock
@@ -618,36 +710,19 @@ void VKContext::start_render_pass(bool create_descriptor_set) {
     }
 
     // only the depth-stencil attachment may be clear if not force loaded. It can sit at attachment index 1 or 2 (raw u16 attachment present) so provide the value at both
-    std::array<vk::ClearValue, 3> curr_clear_values{};
     const vk::ClearDepthStencilValue ds_clear{
         .depth = normalized_depth_clear(record.depth_stencil_surface.background_depth),
         .stencil = record.depth_stencil_surface.stencil
     };
-    curr_clear_values[1].depthStencil = ds_clear;
-    curr_clear_values[2].depthStencil = ds_clear;
-    curr_renderpass_info.setClearValues(curr_clear_values);
-#if ECV_ORACLE
-    if (ecv::oracle::gpu::enabled())
-        ecv::oracle::gpu::rp_begin(reinterpret_cast<uint64_t>(static_cast<VkRenderPass>(current_render_pass)),
-            reinterpret_cast<uint64_t>(static_cast<VkFramebuffer>(current_framebuffer)), is_first_scene_draw, curr_renderpass_info.renderArea.offset.x,
-            curr_renderpass_info.renderArea.offset.y, curr_renderpass_info.renderArea.extent.width, curr_renderpass_info.renderArea.extent.height);
-    if (ecv::oracle::gpu::dbg(ecv::oracle::gpu::DBG_FULL_BARRIER)) {
-        const vk::MemoryBarrier oracle_all{
-            .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-            .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite
-        };
-        render_cmd.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands, {}, oracle_all, {}, {});
+    pass_area = curr_renderpass_info.renderArea;
+    pass_ds_clear = ds_clear;
+    begin_deferred_pass();
+    if (++scene_pass_starts == 2) {
+        vkutil::sync::stats().scenes_restarted++;
+        if (scene_depth_unbacked)
+            vkutil::sync::stats().scenes_unbacked_restarted++;
     }
-#endif
-    render_cmd.beginRenderPass(curr_renderpass_info, vk::SubpassContents::eInline);
-
-    // set the renderpass info ready in case we need to switch between classic and framebuffer fetch usage
-    curr_renderpass_info.setClearValues(nullptr);
     last_draw_was_framebuffer_fetch = false;
-
-    refresh_pipeline = true;
-    current_pipeline = nullptr;
-    split_pipeline = nullptr;
     in_renderpass = true;
 
     if (!create_descriptor_set)
@@ -659,10 +734,11 @@ void VKContext::start_render_pass(bool create_descriptor_set) {
     // update descriptor set for the whole scene with the color attachment
     vk::DescriptorImageInfo descr_color_info{
         .sampler = nullptr,
-        .imageView = current_color_view,
+        .imageView = msaa::fetch_color_view(*this),
         .imageLayout = vk::ImageLayout::eGeneral,
     };
-    if (shell_fetch_snapshot)
+    // the SceShell glow reads a snapshot of a single sample attachment; a multisampled scene reads its multisampled attachment per sample
+    if (shell_fetch_snapshot && !ms_scene.active)
         descr_color_info.imageView = shell_fetch_snapshot->view;
 
     const vk::DescriptorType input_type = state.features.support_shader_interlock ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eInputAttachment;
@@ -677,7 +753,7 @@ void VKContext::start_render_pass(bool create_descriptor_set) {
     if (state.features.preserve_f16_nan_as_u16) {
         vk::DescriptorImageInfo descr_raw_info{
             .sampler = nullptr,
-            .imageView = current_color_raw_view ? current_color_raw_view : state.default_raw_image.view,
+            .imageView = msaa::fetch_raw_view(*this) ? msaa::fetch_raw_view(*this) : state.default_raw_image.view,
             .imageLayout = vk::ImageLayout::eGeneral,
         };
         vk::WriteDescriptorSet write_raw_descr{
@@ -694,15 +770,335 @@ void VKContext::start_render_pass(bool create_descriptor_set) {
     }
 }
 
-void VKContext::stop_render_pass() {
+// ---- deferred pass recording -----------------------------------------------------------------------------------------------
+// The draws of a pass instance are recorded into a SECONDARY command buffer; the instance itself (vkCmdBeginRenderPass / vkCmdBeginRendering)
+// is emitted when it ENDS, so its load/store ops are chosen with the whole instance known:
+//   * the last instance of a scene whose depth has no guest surface behind it does not store the depth (it is dead: the next scene clears it),
+//   * an attachment whose content is known (tracked content state) is CLEARed instead of LOADed, a discarded one is not loaded at all.
+// Everything that used to be a render pass dependency or a layout transition of the VkRenderPass path is a tracker barrier here (dynamic
+// rendering) or is still covered by the pass' external dependencies (VkRenderPass path), see render_pass_sync.h.
+
+void VKContext::begin_deferred_pass() {
+    FrameObject &frame = state.frame();
+    if (frame.secondary_cursor == frame.secondary_cmds.size()) {
+        const vk::CommandBufferAllocateInfo alloc{ .commandPool = frame.render_pool, .level = vk::CommandBufferLevel::eSecondary, .commandBufferCount = 1 };
+        frame.secondary_cmds.push_back(state.device.allocateCommandBuffers(alloc)[0]);
+    }
+    pass_secondary = frame.secondary_cmds[frame.secondary_cursor++];
+    instance_draws = 0;
+    instance_queries = 0;
+    inst_rect = {};
+    inst_depth_overwritten = inst_stencil_overwritten = false;
+    // the ops this instance begins with: later changes of dyn_pass (the "load from now on" upgrades done right after the first draw) are for the NEXT instance
+    inst_pass = dyn_pass;
+
+    vk::CommandBufferInheritanceInfo inherit{};
+    vk::CommandBufferInheritanceRenderingInfo inherit_rendering{};
+    std::array<vk::Format, 2> color_formats{ current_color_format, vk::Format::eR16G16B16A16Uint };
+    if (state.use_dynamic_rendering) {
+        const vk::Format ds_format = current_ds_image ? current_ds_image->format : ds_host_format;
+        inherit_rendering.colorAttachmentCount = dyn_pass.has_raw ? 2u : 1u;
+        inherit_rendering.pColorAttachmentFormats = color_formats.data();
+        inherit_rendering.depthAttachmentFormat = vkutil::format_has_depth(ds_format) ? ds_format : vk::Format::eUndefined;
+        inherit_rendering.stencilAttachmentFormat = vkutil::format_has_stencil(ds_format) ? ds_format : vk::Format::eUndefined;
+        inherit_rendering.rasterizationSamples = ms_scene.active ? ms_scene.samples : vk::SampleCountFlagBits::e1;
+        inherit.pNext = &inherit_rendering;
+    } else {
+        // any compatible pass: load/store ops and layouts do not take part in render pass compatibility
+        inherit.renderPass = interlock_pass_active ? current_shader_interlock_pass : current_render_pass;
+        inherit.subpass = 0;
+        // a multisampled instance creates its framebuffer when it is emitted (its depth/stencil image is chosen then)
+        inherit.framebuffer = ms_scene.active ? vk::Framebuffer{} : (interlock_pass_active ? current_shader_interlock_framebuffer : current_framebuffer);
+    }
+    const vk::CommandBufferBeginInfo begin_info{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit | vk::CommandBufferUsageFlagBits::eRenderPassContinue,
+        .pInheritanceInfo = &inherit
+    };
+    pass_secondary.begin(begin_info);
+    primary_cmd = render_cmd;
+    render_cmd = pass_secondary;
+
+    // a secondary command buffer inherits no dynamic state, no bound pipeline and no bound descriptors: same list as a fresh scene command buffer
+    render_cmd.setViewport(0, viewport);
+    render_cmd.setScissor(0, scissor);
+    applied_bias_valid = false;
+    sync_depth_bias(*this);
+    sync_point_line_width(*this, true);
+    sync_stencil_func(*this, false);
+    if (record.two_sided == SCE_GXM_TWO_SIDED_ENABLED)
+        sync_stencil_func(*this, true);
+    last_vert_texture_count = ~0;
+    last_frag_texture_count = ~0;
+    curr_vert_ublock.changed = true;
+    curr_frag_ublock.changed = true;
+    refresh_pipeline = true;
+    current_pipeline = nullptr;
+    split_pipeline = nullptr;
+    applied_cull_valid = false;
+    // B140: the first draw of a multisampled instance copies the surface into every sample
+    msaa::begin_instance(*this);
+}
+
+void VKContext::emit_pass(bool scene_end) {
+    namespace sync = vkutil::sync;
+    // B140: the surface the instance's seed samples is copied just before the instance (outside a render pass)
+    if (ms_scene.active)
+        msaa::record_copies(*this);
+    // ---- pass scheduling: an instance that draws nothing, clears nothing and has no query changes nothing when it loads what it stores ----
+    // (restarts for a copy / split / flush often begin an instance and end it again before its first draw: begin + end would cost a full load and store of the target)
+    if (instance_draws == 0 && instance_queries == 0 && !inst_depth_overwritten && !inst_stencil_overwritten && inst_pass.depth_load && inst_pass.stencil_load
+        && current_color_loaded && !interlock_pass_active && !ms_scene.active) {
+        sync::stats().passes_elided++;
+        return;
+    }
+    const sync::IRect area_rect{ pass_area.offset.x, pass_area.offset.y, pass_area.offset.x + static_cast<int32_t>(pass_area.extent.width),
+        pass_area.offset.y + static_cast<int32_t>(pass_area.extent.height) };
+    // everything this instance can have written: its draws, and the whole area when it cleared depth/stencil
+    sync::IRect written = inst_rect;
+    if (inst_depth_overwritten || inst_stencil_overwritten)
+        written.add(area_rect);
+    // content states before the begin barriers mark the attachments dirty
+    const sync::State color_before = current_color_base_image ? current_color_base_image->sync : sync::State{};
+    const sync::State raw_before = current_color_raw_image ? current_color_raw_image->sync : sync::State{};
+    const sync::State ds_before = current_ds_image ? current_ds_image->sync : sync::State{};
+    struct KeepCleared {
+        VKContext &c;
+        const sync::State &color, &raw, &ds;
+        const sync::IRect &written;
+        bool disarm = false;
+        ~KeepCleared() {
+            if (disarm)
+                return;
+            if (c.current_color_base_image)
+                sync::keep_cleared_after_pass_begin(c.current_color_base_image->sync, color, written);
+            if (c.current_color_raw_image)
+                sync::keep_cleared_after_pass_begin(c.current_color_raw_image->sync, raw, written);
+            if (c.current_ds_image)
+                sync::keep_cleared_after_pass_begin(c.current_ds_image->sync, ds, written);
+        }
+    } keep_cleared{ *this, color_before, raw_before, ds_before, written };
+    // a multisampled instance renders into its own MS attachments and resolves: the tracked surface images are only written by the resolve, so their
+    // Cleared content is not kept (conservative: Dirty after the pass)
+    if (ms_scene.active)
+        keep_cleared.disarm = true;
+    // ---- the final ops of this instance ----
+    const bool store = derive_depth_store({ inst_pass.guest_store, !scene_depth_unbacked, !scene_end });
+    if (!store)
+        sync::stats().depth_stores_dropped++;
+    bool depth_load = inst_pass.depth_load;
+    bool stencil_load = inst_pass.stencil_load;
+    // retired by coverage: a full-area clear before the first draw makes the loaded content dead, the clear itself (recorded in the instance) provides the values
+    if (depth_load && inst_depth_overwritten) {
+        depth_load = false;
+        sync::stats().loads_retired++;
+    }
+    if (stencil_load && inst_stencil_overwritten) {
+        stencil_load = false;
+        sync::stats().loads_retired++;
+    }
+    // depth and stencil share one content state: only an instance that loads both can be rewritten
+    sync::LoadChoice ds_choice = sync::LoadChoice::Load;
+    if (depth_load && stencil_load && current_ds_image && current_ds_image->image) {
+        ds_choice = sync::derive_load_in_area(current_ds_image->sync, area_rect, true);
+        (ds_choice == sync::LoadChoice::Clear ? sync::stats().loads_to_clear : ds_choice == sync::LoadChoice::DontCare ? sync::stats().loads_to_dontcare : sync::stats().loads_kept)++;
+    }
+    const sync::ClearValue ds_cleared = current_ds_image ? current_ds_image->sync.cleared_to : sync::ClearValue{};
+    vk::ClearDepthStencilValue ds_clear = pass_ds_clear;
+    if (ds_choice == sync::LoadChoice::Clear)
+        ds_clear = vk::ClearDepthStencilValue{ ds_cleared.depth, ds_cleared.stencil };
+    const bool ds_discard = ds_choice == sync::LoadChoice::DontCare;
+    // a multisampled instance resolves into the single sample depth/stencil (content outside the render area survives): tracked as kept
+    const bool ds_loaded = ms_scene.active || ((depth_load || stencil_load) && ds_choice == sync::LoadChoice::Load);
+    if (ds_choice != sync::LoadChoice::Load)
+        depth_load = stencil_load = false; // CLEAR (VkRenderPass: the variant that clears) / DONT_CARE (dynamic rendering, below)
+
+#if ECV_ORACLE
+    if (ecv::oracle::gpu::enabled())
+        ecv::oracle::gpu::rp_begin(reinterpret_cast<uint64_t>(static_cast<VkRenderPass>(current_render_pass)),
+            reinterpret_cast<uint64_t>(static_cast<VkFramebuffer>(current_framebuffer)), is_first_scene_draw, pass_area.offset.x, pass_area.offset.y,
+            pass_area.extent.width, pass_area.extent.height);
+    // oracle A/B (dbg-full-barrier): the tracker widens every barrier to ALL_COMMANDS and adds one global barrier here
+    vkutil::sync::config().full_barrier = ecv::oracle::gpu::dbg(ecv::oracle::gpu::DBG_FULL_BARRIER);
+    vkutil::sync::debug_full_barrier(render_cmd);
+#endif
+
+    if (!state.use_dynamic_rendering) {
+        vk::RenderPass pass;
+        vk::Framebuffer framebuffer;
+        if (interlock_pass_active) {
+            pass = current_shader_interlock_pass;
+            framebuffer = current_shader_interlock_framebuffer;
+        } else {
+            pass = state.pipeline_cache.retrieve_render_pass(current_color_format, depth_load, stencil_load, store, !record.color_surface.data, false,
+                record.color_base_format == SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16, ds_host_format);
+            framebuffer = current_framebuffer;
+        }
+        // sync tracker: the pass' external dependencies cover the tracked state of the attachments, else an explicit barrier first
+        sync::Batch pass_batch;
+        const auto begin_attachment = [&](vkutil::Image *img, PassAttachment kind, bool loaded, const vk::ImageSubresourceRange &range) {
+            if (!img || !img->image)
+                return;
+            const sync::PassCoverage cov = pass_coverage(kind, loaded);
+            if (loaded && img->sync.layout == vk::ImageLayout::eUndefined) {
+                // never seen by the tracker: the pass runs on these without a barrier, adopt the layout it expects instead of an UNDEFINED -> X transition that would drop the content
+                LOG_WARN_ONCE("Render pass attachment with untracked layout: adopting the pass' initial layout");
+                img->sync.layout = cov.initial_layout;
+            }
+            sync::Barrier b;
+            const sync::UseResult r = sync::track_pass_begin(img->sync, cov, b);
+            if (r.barrier) {
+                sync::stats().pass_explicit++;
+                pass_batch.explicit_image(img->image, range, b);
+            } else {
+                sync::stats().pass_covered++;
+            }
+        };
+        begin_attachment(current_color_base_image, PassAttachment::Color, current_color_loaded, vkutil::color_subresource_range);
+        begin_attachment(current_color_raw_image, PassAttachment::ColorRaw, true, vkutil::color_subresource_range);
+        begin_attachment(current_ds_image, PassAttachment::DepthStencil, ds_loaded,
+            vkutil::aspect_clamped_range(current_ds_image ? current_ds_image->format : vk::Format::eUndefined, vkutil::ds_subresource_range));
+        pass_batch.flush(render_cmd);
+
+        if (ms_scene.active) {
+            msaa::record_render_pass(*this, MsaaInstance{ !scene_end, inst_pass.guest_store, ds_clear, pass_area });
+        } else {
+            std::array<vk::ClearValue, 3> clear_values{};
+            clear_values[1].depthStencil = ds_clear;
+            clear_values[2].depthStencil = ds_clear;
+            vk::RenderPassBeginInfo info{ .renderPass = pass, .framebuffer = framebuffer, .renderArea = pass_area };
+            info.setClearValues(clear_values);
+            render_cmd.beginRenderPass(info, vk::SubpassContents::eSecondaryCommandBuffers);
+            render_cmd.executeCommands(pass_secondary);
+            render_cmd.endRenderPass();
+        }
+
+        // sync tracker: what the pass wrote and what its outgoing dependency made visible
+        if (current_color_base_image && current_color_base_image->image)
+            note_pass_end(current_color_base_image->sync, PassAttachment::Color);
+        if (current_color_raw_image && current_color_raw_image->image)
+            note_pass_end(current_color_raw_image->sync, PassAttachment::ColorRaw);
+        if (current_ds_image && current_ds_image->image)
+            note_pass_end(current_ds_image->sync, PassAttachment::DepthStencil);
+        return;
+    }
+
+    // ---- dynamic rendering: attachments to attachment use (tracker), begin, execute, end, attachments back to their sampling state ----
+    const sync::Stage color_stages = sync::S::eColorAttachmentOutput | sync::S::eFragmentShader;
+    const sync::Access color_access = sync::A::eColorAttachmentRead | sync::A::eColorAttachmentWrite | sync::A::eInputAttachmentRead;
+    const sync::Stage ds_stages = sync::S::eEarlyFragmentTests | sync::S::eLateFragmentTests;
+    const sync::Access ds_access = sync::A::eDepthStencilAttachmentRead | sync::A::eDepthStencilAttachmentWrite;
+
+    const auto choose = [&](vkutil::Image *img, bool wants) {
+        if (!wants || !img || !img->image)
+            return wants ? sync::LoadChoice::Load : sync::LoadChoice::DontCare;
+        const sync::LoadChoice c = sync::derive_load_in_area(img->sync, area_rect, true);
+        (c == sync::LoadChoice::Clear ? sync::stats().loads_to_clear : c == sync::LoadChoice::DontCare ? sync::stats().loads_to_dontcare : sync::stats().loads_kept)++;
+        return c;
+    };
+    const sync::LoadChoice color_choice = choose(current_color_base_image, current_color_loaded);
+    const sync::LoadChoice raw_choice = inst_pass.has_raw ? choose(current_color_raw_image, true) : sync::LoadChoice::Load;
+    const sync::ClearValue color_cleared = current_color_base_image ? current_color_base_image->sync.cleared_to : sync::ClearValue{};
+
+    sync::Batch batch;
+    const auto prepare = [&](vkutil::Image *img, sync::Stage stages, sync::Access access, vk::ImageLayout layout, bool loaded, const vk::ImageSubresourceRange &range) {
+        if (!img || !img->image)
+            return;
+        if (loaded && img->sync.layout == vk::ImageLayout::eUndefined) {
+            // never seen by the tracker: keep their content, assume the layout the sampling code leaves them in
+            LOG_WARN_ONCE("Dynamic rendering attachment with untracked layout: assuming the layout the sampling code leaves it in");
+            img->sync.layout = layout == vk::ImageLayout::eDepthStencilAttachmentOptimal ? vk::ImageLayout::eDepthStencilReadOnlyOptimal : layout;
+        }
+        batch.use_image(img->sync, img->image, range, stages, access, layout, !loaded);
+    };
+    prepare(current_color_base_image, color_stages, color_access, vk::ImageLayout::eGeneral, ms_scene.active || color_choice == sync::LoadChoice::Load, vkutil::color_subresource_range);
+    if (inst_pass.has_raw)
+        prepare(current_color_raw_image, color_stages, color_access, vk::ImageLayout::eGeneral, ms_scene.active || raw_choice == sync::LoadChoice::Load, vkutil::color_subresource_range);
+    const vk::Format ds_format = current_ds_image ? current_ds_image->format : vk::Format::eUndefined;
+    const bool ds_has_stencil = vkutil::format_has_stencil(ds_format);
+    const bool ds_has_depth = vkutil::format_has_depth(ds_format);
+    prepare(current_ds_image, ds_stages, ds_access, vk::ImageLayout::eDepthStencilAttachmentOptimal, ds_loaded, vkutil::aspect_clamped_range(ds_format, vkutil::ds_subresource_range));
+    batch.flush(render_cmd);
+
+    std::array<vk::RenderingAttachmentInfo, 2> colors{};
+    colors[0] = vk::RenderingAttachmentInfo{
+        .imageView = current_color_view,
+        .imageLayout = vk::ImageLayout::eGeneral,
+        .loadOp = color_choice == sync::LoadChoice::Load ? vk::AttachmentLoadOp::eLoad
+            : color_choice == sync::LoadChoice::Clear     ? vk::AttachmentLoadOp::eClear
+                                                          : vk::AttachmentLoadOp::eDontCare,
+        .storeOp = current_color_loaded ? vk::AttachmentStoreOp::eStore : vk::AttachmentStoreOp::eDontCare,
+    };
+    colors[0].clearValue.color = vk::ClearColorValue(std::array<float, 4>{ color_cleared.color[0], color_cleared.color[1], color_cleared.color[2], color_cleared.color[3] });
+    colors[1] = vk::RenderingAttachmentInfo{
+        .imageView = current_color_raw_view,
+        .imageLayout = vk::ImageLayout::eGeneral,
+        .loadOp = raw_choice == sync::LoadChoice::Load ? vk::AttachmentLoadOp::eLoad
+            : raw_choice == sync::LoadChoice::Clear     ? vk::AttachmentLoadOp::eClear
+                                                        : vk::AttachmentLoadOp::eDontCare,
+        .storeOp = vk::AttachmentStoreOp::eStore,
+    };
+    colors[1].clearValue.color.setUint32({ 0, 0, 0, 0 });
+    const vk::AttachmentStoreOp store_op = store ? vk::AttachmentStoreOp::eStore : vk::AttachmentStoreOp::eDontCare;
+    const auto ds_load_op = [&](bool wants_load) {
+        if (ds_discard)
+            return vk::AttachmentLoadOp::eDontCare;
+        return wants_load ? vk::AttachmentLoadOp::eLoad : vk::AttachmentLoadOp::eClear;
+    };
+    vk::RenderingAttachmentInfo depth{
+        .imageView = current_ds_view,
+        .imageLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+        .loadOp = ds_load_op(depth_load),
+        .storeOp = store_op,
+    };
+    depth.clearValue.depthStencil = ds_clear;
+    vk::RenderingAttachmentInfo stencil{
+        .imageView = current_ds_view,
+        .imageLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+        .loadOp = ds_load_op(stencil_load),
+        .storeOp = store_op,
+    };
+    stencil.clearValue.depthStencil = ds_clear;
+
+    vk::RenderingInfo rendering{
+        .flags = vk::RenderingFlagBits::eContentsSecondaryCommandBuffers,
+        .renderArea = pass_area,
+        .layerCount = 1,
+        .colorAttachmentCount = inst_pass.has_raw ? 2u : 1u,
+        .pColorAttachments = colors.data(),
+        .pDepthAttachment = ds_has_depth ? &depth : nullptr,
+        .pStencilAttachment = ds_has_stencil ? &stencil : nullptr,
+    };
+    if (ms_scene.active) {
+        msaa::record_rendering(*this, MsaaInstance{ !scene_end, inst_pass.guest_store, ds_clear, pass_area });
+    } else {
+        render_cmd.beginRenderingKHR(rendering);
+        render_cmd.executeCommands(pass_secondary);
+        render_cmd.endRenderingKHR();
+    }
+
+    const sync::Stage sampled = sync::S::eVertexShader | sync::S::eFragmentShader | sync::S::eTransfer;
+    const sync::Access readable = sync::A::eShaderRead | sync::A::eTransferRead | sync::A::eInputAttachmentRead;
+    sync::Batch after;
+    const auto finish = [&](vkutil::Image *img, vk::ImageLayout layout, const vk::ImageSubresourceRange &range) {
+        if (img && img->image)
+            after.use_image(img->sync, img->image, range, sampled, readable, layout, false);
+    };
+    finish(current_color_base_image, vk::ImageLayout::eGeneral, vkutil::color_subresource_range);
+    if (inst_pass.has_raw)
+        finish(current_color_raw_image, vk::ImageLayout::eGeneral, vkutil::color_subresource_range);
+    finish(current_ds_image, vk::ImageLayout::eDepthStencilReadOnlyOptimal, vkutil::aspect_clamped_range(ds_format, vkutil::ds_subresource_range));
+    after.flush(render_cmd);
+}
+
+void VKContext::stop_render_pass(bool scene_end) {
     if (!in_renderpass) {
         LOG_ERROR("Stopping render pass while not in render pass");
         return;
     }
 
-    // do this before ending the render pass
+    // do this before ending the secondary command buffer
     if (is_in_query) {
-        render_cmd.endQuery(current_visibility_buffer->query_pool, current_query_idx);
+        render_cmd.endQuery(current_visibility_buffer->query_pool, running_query_slot);
         is_in_query = false;
     }
 
@@ -710,9 +1106,10 @@ void VKContext::stop_render_pass() {
     if (ecv::oracle::gpu::enabled())
         ecv::oracle::gpu::rp_end();
 #endif
-    render_cmd.endRenderPass();
+    pass_secondary.end();
+    render_cmd = primary_cmd;
+    emit_pass(scene_end);
     prev_draw_fbfetch = false;
-
     in_renderpass = false;
 }
 
@@ -728,7 +1125,7 @@ void VKContext::abandon_empty_recording() {
     is_recording = false;
 }
 
-void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNotification &notif2, bool submit) {
+void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNotification &notif2, bool submit, bool scene_end) {
     if (!is_recording) {
         LOG_ERROR("Stopping recording while not recording");
         return;
@@ -738,43 +1135,35 @@ void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNot
     ecv::oracle::gpu::rp_reason("stop_recording");
 #endif
     if (in_renderpass)
-        stop_render_pass();
+        stop_render_pass(scene_end);
 
-    struct VisibilityRange {
-        uint32_t offset;
-        uint32_t size;
-    };
-    std::vector<VisibilityRange> occlusion_ranges;
+    // the visibility queries of this scene: reset before the render pass, copy the slots to a host readable buffer at its end
     if (visibility_max_used_idx != -1) {
-        // get all the entry ranges that were used
-        bool in_range = false;
-        uint32_t range_start = 0;
-        for (uint32_t entry = 0; entry <= visibility_max_used_idx + 1; entry++) {
-            if (current_visibility_buffer->queries_used[entry] == in_range)
+        for (auto &[address, vb] : visibility_buffers) {
+            if (vb.scene.empty())
                 continue;
+            const uint32_t slots = vb.scene.slots();
+            auto resolve = std::make_shared<VisibilityResolve>();
+            resolve->address = vb.address;
+            resolve->activations = std::move(vb.scene.activations);
+            vb.scene.activations.clear();
+            resolve->staging.size = static_cast<vk::DeviceSize>(slots) * sizeof(uint32_t);
+            resolve->staging.init_buffer(vk::BufferUsageFlagBits::eTransferDst, vkutil::vma_readback_alloc);
 
-            if (in_range) {
-                occlusion_ranges.push_back({ range_start, entry - range_start });
-                in_range = false;
-            } else {
-                range_start = entry;
-                in_range = true;
-            }
-        }
-
-        for (auto &range : occlusion_ranges) {
-            // reset before the beginning of the render pass
-            prerender_cmd.resetQueryPool(current_visibility_buffer->query_pool, range.offset, range.size);
-
-            // wait for the range at the end
+            prerender_cmd.resetQueryPool(vb.query_pool, 0, slots);
             // TODO: this will be wrong with upscaling enabled and precise mode set
-            render_cmd.copyQueryPoolResults(current_visibility_buffer->query_pool, range.offset, range.size,
-                current_visibility_buffer->gpu_buffer, current_visibility_buffer->buffer_offset + range.offset * sizeof(uint32_t),
-                sizeof(uint32_t), vk::QueryResultFlagBits::eWait);
+            render_cmd.copyQueryPoolResults(vb.query_pool, 0, slots, resolve->staging.buffer, 0, sizeof(uint32_t), vk::QueryResultFlagBits::eWait);
+            pending_visibility.push_back(std::move(resolve));
         }
         visibility_max_used_idx = -1;
-        // The range builder reads one false sentinel after the final query.
-        current_visibility_buffer->queries_used.assign(current_visibility_buffer->size + 1, false);
+    }
+
+    if (!state.features.enable_memory_mapping && !pending_buffer_stores.empty()) {
+        // shader stores into the storage-buffer copy of the guest buffers become visible to the host read after the fence
+        vkutil::sync::Batch batch;
+        batch.global(vkutil::sync::S::eVertexShader | vkutil::sync::S::eFragmentShader, vkutil::sync::A::eShaderWrite,
+            vkutil::sync::S::eHost, vkutil::sync::A::eHostRead);
+        batch.flush(render_cmd);
     }
 
     // remember which part of the colour surface this scene's draws could have touched (for write-back bounds)
@@ -814,6 +1203,18 @@ void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNot
 
     vk::SubmitInfo submit_info{};
     submit_info.setCommandBuffers(cmdbuffers_to_submit);
+    // timeline submit tracking: this submit also signals the next value; the fence stays for the per-scene recycling
+    uint64_t timeline_value = 0;
+    vk::TimelineSemaphoreSubmitInfo timeline_info{};
+    if (state.submit_timeline) {
+        timeline_value = ++state.submit_counter;
+        timeline_info.signalSemaphoreValueCount = 1;
+        timeline_info.pSignalSemaphoreValues = &timeline_value;
+        submit_info.pNext = &timeline_info;
+        submit_info.signalSemaphoreCount = 1;
+        submit_info.pSignalSemaphores = &state.submit_timeline;
+        state.frame().rendered_timeline_value = timeline_value;
+    }
 #if ECV_ORACLE
     if (ecv::oracle::gpu::dbg(ecv::oracle::gpu::DBG_IDLE_SUBMIT))
         state.general_queue.waitIdle();
@@ -828,63 +1229,37 @@ void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNot
     cmdbuffers_to_submit.clear();
     state.frame().rendered_fences.push_back(fence);
 
+    if (!state.features.enable_memory_mapping && (!pending_visibility.empty() || !pending_buffer_stores.empty())) {
+        // no wait thread without memory mapping: wait for this scene and write the entries and the stored bytes right here
+        const vk::Result wait_result = state.device.waitForFences(fence, VK_TRUE, std::numeric_limits<uint64_t>::max());
+        if (wait_result == vk::Result::eSuccess) {
+            for (auto &resolve : pending_visibility)
+                resolve_visibility(mem, *resolve);
+            apply_buffer_stores(mem);
+        } else {
+            for (auto &resolve : pending_visibility)
+                resolve->staging.destroy();
+        }
+        pending_visibility.clear();
+        pending_buffer_stores.clear();
+    }
+
     if (state.features.enable_memory_mapping) {
         // send it to the wait queue
-        state.request_queue.push(FenceWaitRequest{ fence });
+        state.request_queue.push(FenceWaitRequest{ fence, timeline_value });
+
+        for (auto &resolve : pending_visibility)
+            state.request_queue.push(VisibilityResolveRequest{ std::move(resolve) });
+        pending_visibility.clear();
 
         if (state.mapping_method == MappingMethod::DoubleBuffer) {
-            // sync all the visibility buffers
-            for (auto &range : occlusion_ranges) {
-#if ECV_ORACLE
-                if (ecv::oracle::gpu::dbg(ecv::oracle::gpu::DBG_UB_CHECK))
-                    ecv::oracle::gpu::vis_note(current_visibility_buffer->address + range.offset * 4, range.size * 4);
-                if (ecv::oracle::gpu::dbg(ecv::oracle::gpu::DBG_NO_VIS_SYNC))
-                    continue;
-#endif
-                state.request_queue.push(BufferSyncRequest{ current_visibility_buffer->address + range.offset * 4, range.size * 4 });
-            }
-
-            // we must sync the two buffers
+            // we must sync the two buffers (the transfers recorded since the last submit first, then this scene's surface)
+            for (const BufferSyncRequest &request : pending_buffer_syncs)
+                state.request_queue.push(request);
+            pending_buffer_syncs.clear();
             if (surface_info && surface_info->need_buffer_sync) {
-                const bool partial_sync = surface_info->partial_write_back
-                    || surface_info->post_sync_x0 != 0 || surface_info->post_sync_y0 != 0
-                    || surface_info->post_sync_width < surface_info->original_width
-                    || surface_info->post_sync_height < surface_info->original_height;
-                if (partial_sync) {
-                    const uint32_t bpp = gxm::bits_per_pixel(surface_info->format) / 8;
-                    const uint32_t row_stride_bytes = surface_info->stride_bytes;
-                    const int32_t x0 = surface_info->post_sync_x0;
-                    const int32_t y0 = surface_info->post_sync_y0;
-                    const uint32_t width = surface_info->post_sync_width;
-                    const uint32_t height = surface_info->post_sync_height;
-                    const bool rect_in_bounds = bpp != 0 && x0 >= 0 && y0 >= 0
-                        && static_cast<uint32_t>(x0) <= surface_info->original_width
-                        && static_cast<uint32_t>(y0) <= surface_info->original_height
-                        && width <= surface_info->original_width - static_cast<uint32_t>(x0)
-                        && height <= surface_info->original_height - static_cast<uint32_t>(y0);
-                    const uint64_t row_bytes64 = static_cast<uint64_t>(width) * bpp;
-                    const uint64_t column_offset = static_cast<uint64_t>(x0) * bpp;
-                    const bool row_in_bounds = column_offset <= row_stride_bytes
-                        && row_bytes64 <= row_stride_bytes - column_offset;
-                    const uint64_t address_offset = static_cast<uint64_t>(y0) * row_stride_bytes + column_offset;
-                    const uint64_t address64 = static_cast<uint64_t>(surface_info->data.address()) + address_offset;
-                    const auto span = rect_in_bounds && row_in_bounds && row_bytes64 <= std::numeric_limits<uint32_t>::max()
-                        ? surface_sync_rows_span(row_stride_bytes, static_cast<size_t>(row_bytes64), height)
-                        : std::optional<size_t>{};
-                    if (span && *span > 0 && *span <= std::numeric_limits<uint32_t>::max()
-                        && address64 <= std::numeric_limits<Address>::max()) {
-                        state.request_queue.push(BufferSyncRequest{
-                            static_cast<Address>(address64),
-                            static_cast<uint32_t>(*span),
-                            row_stride_bytes,
-                            static_cast<uint32_t>(row_bytes64),
-                            height });
-                    } else {
-                        LOG_ERROR("Skipping invalid partial surface buffer sync");
-                    }
-                } else {
-                    state.request_queue.push(BufferSyncRequest{ surface_info->data.address(), static_cast<uint32_t>(surface_info->total_bytes) });
-                }
+                if (const auto request = make_buffer_sync_request(*surface_info))
+                    state.request_queue.push(*request);
             }
         }
 
@@ -908,6 +1283,93 @@ void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNot
     }
 }
 
+void VKContext::collect_buffer_stores(MemState &mem) {
+    if (draw_store_blocks.empty())
+        return;
+    uint8_t stages = state.pipeline_cache.pipeline_buffer_stores(current_pipeline);
+    if (split_pipeline)
+        stages |= state.pipeline_cache.pipeline_buffer_stores(split_pipeline);
+    if (stages != 0) {
+        for (buffer_store::Block block : draw_store_blocks) {
+            if (!(stages & block.stage))
+                continue;
+            const vkutil::HostRingBuffer &ring = block.stage == buffer_store::Vertex ? vertex_uniform_stream_ring_buffer : fragment_uniform_stream_ring_buffer;
+            block.ring_offset += ring.data_offset;
+            block.ring_wraps = ring.wrap_count();
+            PendingBufferStore pending;
+            pending.block = block;
+            if (is_valid_addr_range(mem, block.guest_address, block.guest_address + block.size)) {
+                const uint8_t *guest = Ptr<uint8_t>(block.guest_address).get(mem);
+                pending.before.assign(guest, guest + block.size);
+                pending_buffer_stores.push_back(std::move(pending));
+            }
+        }
+    }
+    draw_store_blocks.clear();
+}
+
+void VKContext::apply_buffer_stores(MemState &mem) {
+    std::vector<uint8_t> after;
+    for (const PendingBufferStore &pending : pending_buffer_stores) {
+        const buffer_store::Block &block = pending.block;
+        vkutil::HostRingBuffer &ring = block.stage == buffer_store::Vertex ? vertex_uniform_stream_ring_buffer : fragment_uniform_stream_ring_buffer;
+        if (!buffer_store::range_in_buffer(ring.buffer_bytes(), block.ring_offset, block.size)
+            || !buffer_store::ring_data_intact(block.ring_wraps, block.ring_offset, block.size, ring.wrap_count(), ring.cursor_bytes())) {
+            LOG_WARN_ONCE("A shader store into guest buffer 0x{:08X} was lost: the stream ring buffer was reused before the scene finished", block.guest_address);
+            continue;
+        }
+        after.resize(block.size);
+        ring.read_back(block.ring_offset, block.size, after.data());
+        for (const buffer_store::Run &run : buffer_store::changed_runs(pending.before.data(), after.data(), block.size)) {
+            const Address address = block.guest_address + run.offset;
+            if (!is_valid_addr_range(mem, address, address + run.length))
+                continue;
+            memcpy(Ptr<uint8_t>(address).get(mem), after.data() + run.offset, run.length);
+        }
+    }
+}
+
+std::optional<BufferSyncRequest> VKContext::make_buffer_sync_request(const ColorSurfaceCacheInfo &info) {
+    const bool partial_sync = info.partial_write_back
+        || info.post_sync_x0 != 0 || info.post_sync_y0 != 0
+        || info.post_sync_width < info.original_width
+        || info.post_sync_height < info.original_height;
+    if (partial_sync) {
+        const uint32_t bpp = gxm::bits_per_pixel(info.format) / 8;
+        const uint32_t row_stride_bytes = info.stride_bytes;
+        const int32_t x0 = info.post_sync_x0;
+        const int32_t y0 = info.post_sync_y0;
+        const uint32_t width = info.post_sync_width;
+        const uint32_t height = info.post_sync_height;
+        const bool rect_in_bounds = bpp != 0 && x0 >= 0 && y0 >= 0
+            && static_cast<uint32_t>(x0) <= info.original_width
+            && static_cast<uint32_t>(y0) <= info.original_height
+            && width <= info.original_width - static_cast<uint32_t>(x0)
+            && height <= info.original_height - static_cast<uint32_t>(y0);
+        const uint64_t row_bytes64 = static_cast<uint64_t>(width) * bpp;
+        const uint64_t column_offset = static_cast<uint64_t>(x0) * bpp;
+        const bool row_in_bounds = column_offset <= row_stride_bytes
+            && row_bytes64 <= row_stride_bytes - column_offset;
+        const uint64_t address_offset = static_cast<uint64_t>(y0) * row_stride_bytes + column_offset;
+        const uint64_t address64 = static_cast<uint64_t>(info.data.address()) + address_offset;
+        const auto span = rect_in_bounds && row_in_bounds && row_bytes64 <= std::numeric_limits<uint32_t>::max()
+            ? surface_sync_rows_span(row_stride_bytes, static_cast<size_t>(row_bytes64), height)
+            : std::optional<size_t>{};
+        if (span && *span > 0 && *span <= std::numeric_limits<uint32_t>::max()
+            && address64 <= std::numeric_limits<Address>::max()) {
+            return BufferSyncRequest{
+                static_cast<Address>(address64),
+                static_cast<uint32_t>(*span),
+                row_stride_bytes,
+                static_cast<uint32_t>(row_bytes64),
+                height };
+        }
+        LOG_ERROR("Skipping invalid partial surface buffer sync");
+        return std::nullopt;
+    }
+    return BufferSyncRequest{ info.data.address(), static_cast<uint32_t>(info.total_bytes) };
+}
+
 void VKContext::check_for_macroblock_change(bool is_draw) {
     if (!render_target || !render_target->has_macroblock_sync)
         return;
@@ -917,8 +1379,8 @@ void VKContext::check_for_macroblock_change(bool is_draw) {
         // so fallback to the slow path (one scene per draw, can't really do better)
         // TODO: with the feedback loop extension we can do better
         ignore_macroblock = true;
-        // in this case we must load and store the depth stencil each time
-        current_render_pass = state.pipeline_cache.retrieve_render_pass(current_color_format, true, true, true, !record.color_surface.data, false, record.color_base_format == SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16, ds_host_format);
+        // in this case every instance must load the depth stencil (its store follows from "this is not the end of the scene")
+        dyn_pass.depth_load = dyn_pass.stencil_load = true;
     }
 
     // use the scissor to know in which macroblock we are
@@ -1026,6 +1488,17 @@ void new_frame(VKContext &context) {
             }
         }
 
+        // timeline tracking: the semaphore value can be reached a moment before the same submit's fence is signalled, and a fence must be
+        // signalled before it is reset. Bounded like the waits above.
+        if (context.state.submit_timeline) {
+            vk::Result fence_result;
+            do {
+                fence_result = device.waitForFences(frame.rendered_fences, VK_TRUE, 100'000'000ULL);
+                if (fence_result == vk::Result::eTimeout && context.state.render_abort.load(std::memory_order_relaxed))
+                    return;
+            } while (fence_result == vk::Result::eTimeout);
+            frame.rendered_timeline_value = 0;
+        }
         // reset the fences in both case (the wait thread does not do that as they can still be used)
         device.resetFences(frame.rendered_fences);
         frame.rendered_fences.clear();
@@ -1033,6 +1506,7 @@ void new_frame(VKContext &context) {
 
     device.resetCommandPool(frame.prerender_pool);
     device.resetCommandPool(frame.render_pool);
+    frame.secondary_cursor = 0;
 
     // set the position in the used descriptor queue back to the beginning
     for (int i = 0; i < 16; i++) {
@@ -1040,6 +1514,7 @@ void new_frame(VKContext &context) {
         frame.frag_descriptors[i].descriptors_idx = 0;
     }
     frame.color_descriptor.descriptors_idx = 0;
+    msaa::begin_frame(context.state, static_cast<int>(&frame - context.state.frames.data()));
 
     // deferred destruction of the objects
     frame.destroy_queue.destroy_objects();

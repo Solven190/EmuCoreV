@@ -20,15 +20,20 @@
 #include <renderer/state.h>
 #include <renderer/types.h>
 
+#include <renderer/vulkan/colour_format_model.h>
 #include <renderer/vulkan/depth_stencil_model.h>
+#include <renderer/vulkan/gpu_caps.h>
+#include <renderer/vulkan/msaa.h>
 #include <renderer/vulkan/overlay_renderer.h>
 #include <renderer/vulkan/pipeline_cache.h>
+#include <renderer/vulkan/sampler_support.h>
 #include <renderer/vulkan/screen_renderer.h>
 #include <renderer/vulkan/surface_cache.h>
 #include <renderer/vulkan/types.h>
 
 #include <atomic>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 
 struct Config;
@@ -60,12 +65,25 @@ struct VKState : public renderer::State {
     int gpu_idx;
 
     VKSurfaceCache surface_cache;
+    MsaaState msaa_state;
     PipelineCache pipeline_cache;
     VKTextureCache texture_cache;
 
     vk::Instance instance;
     vk::Device device;
     bool support_device_fault = false;
+    // capability layer + the path table chosen from it at device creation (gpu_caps.h)
+    GpuCaps gpu_caps;
+    Strategy gpu_strategy;
+    // RenderPath::DynamicRendering: scenes use vkCmdBeginRendering (+ local read), no VkRenderPass/VkFramebuffer objects
+    bool use_dynamic_rendering = false;
+    // StrategyL::extended_dynamic_state: the cull mode is dynamic state set per draw (pipeline_cache.cpp, scene.cpp)
+    bool use_extended_dynamic_state = false;
+    // FbFetchPath::CopySnapshot: framebuffer-fetch draws read a snapshot copy of the attachment (set from the strategy or the start-up self-test verdict)
+    bool use_copy_snapshot = false;
+    // SubmitTracking::TimelineSemaphore: every scene submit signals ++submit_counter (render thread only); null when fences are used
+    vk::Semaphore submit_timeline = nullptr;
+    uint64_t submit_counter = 0;
 
     ScreenRenderer screen_renderer;
     OverlayRenderer overlay_renderer;
@@ -78,6 +96,17 @@ struct VKState : public renderer::State {
     std::vector<vk::QueueFamilyProperties> physical_device_queue_families;
     // combined depth+stencil format for attachments with no guest surface behind them (and the fallback of everything else)
     vk::Format deep_stencil_use;
+    // host format of a GXM colour base format as probed at start up (GpuCaps::colour_format, P7); nothing for a format the renderer does not render to,
+    // the legacy mapping while the probe has not run
+    std::optional<colourmodel::SurfaceFormatTable::Entry> colour_entry(const SceGxmColorBaseFormat base) const {
+        const colourmodel::Fmt f = colourmodel::fmt_of(base);
+        if (f == colourmodel::Fmt::Count)
+            return std::nullopt;
+        const GpuCaps::ColourFormatCap &cap = gpu_caps.colour_format[static_cast<size_t>(f)];
+        if (cap.host_format == 0)
+            return colourmodel::SurfaceFormatTable()[f];
+        return colourmodel::SurfaceFormatTable::Entry{ static_cast<vk::Format>(cap.host_format), static_cast<colourmodel::Repack>(cap.repack), cap.blend_ok, cap.lossy, cap.forced };
+    }
     // host format of each GXM depth/stencil class, chosen from the probed format features (screen_renderer.cpp setup)
     std::array<vk::Format, static_cast<size_t>(dsmodel::DsClass::Count)> ds_class_format{};
 
@@ -144,6 +173,10 @@ struct VKState : public renderer::State {
     vkutil::Image default_image;
     vkutil::Image default_raw_image;
     vkutil::Buffer default_buffer;
+
+    // mirror-clamp / YCbCr capabilities and sampler limits chosen at device creation (P4/P6)
+    SamplerDeviceSupport sampler_device_support;
+    renderer::SamplerSupport sampler_support;
 
     bool support_fsr = false;
     // support for the VK_KHR_uniform_buffer_standard_layout extension, needed for memory mapping and texture viewport

@@ -33,6 +33,7 @@ vk::PipelineColorBlendAttachmentState translate_alpha_surface_blend(vk::Pipeline
 
 vk::Format translate_attribute_format(SceGxmAttributeFormat format, unsigned int component_count, bool is_integer, bool is_signed);
 vk::BlendFactor translate_blend_factor(const SceGxmBlendFactor blend_factor);
+vk::BlendFactor translate_blend_factor_alpha(const SceGxmBlendFactor blend_factor);
 vk::BlendOp translate_blend_func(const SceGxmBlendFunc blend_func);
 vk::PrimitiveTopology translate_primitive(SceGxmPrimitiveType primitive);
 vk::CompareOp translate_depth_func(SceGxmDepthFunc depth_func);
@@ -50,7 +51,8 @@ vk::ComponentMapping translate_swizzle(SceGxmColorFormat format);
 namespace texture {
 vk::Format translate_format(SceGxmTextureBaseFormat base_format);
 vk::ComponentMapping translate_swizzle(SceGxmTextureFormat format);
-vk::SamplerAddressMode translate_address_mode(SceGxmTextureAddrMode src);
+// mirror_clamp_supported: VK_KHR_sampler_mirror_clamp_to_edge is enabled on the device (see renderer/sampler_state.h)
+vk::SamplerAddressMode translate_address_mode(SceGxmTextureAddrMode src, bool mirror_clamp_supported);
 vk::Filter translate_filter(SceGxmTextureFilter src);
 } // namespace texture
 

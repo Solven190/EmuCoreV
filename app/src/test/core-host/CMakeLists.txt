@@ -33,6 +33,7 @@ add_executable(core_host_tests
     rtc_text_tests.cpp
     ngs_dsp_tests.cpp
     ngs_effects_tests.cpp
+    ngs_scheduler_tests.cpp
     hle_stub_batch3_tests.cpp
     hle_stub_batch4_tests.cpp
     hle_stub_wave1_tests.cpp
@@ -40,6 +41,7 @@ add_executable(core_host_tests
     save_data_write_tests.cpp
     fragment_output_tests.cpp
     surface_policy_tests.cpp
+    texture_policy_tests.cpp
     camera_mic_tests.cpp
     shader_cache_file_tests.cpp)
 # xxhash.c is compiled in; shader_cache_file.h only needs its declarations
@@ -148,9 +150,20 @@ target_link_options(surface_codec_host_tests PRIVATE -static -Wl,/force:unresolv
 # B132 render-pass / layout-table sync masks (vulkan.hpp structs only, no device).
 # Build and run with run-core-host-tests.ps1 -Target render_sync_host_tests.
 add_executable(render_sync_host_tests EXCLUDE_FROM_ALL
-    render_pass_sync_tests.cpp "${CORE_ROOT}/vkutil/src/vkutil.cpp")
+    render_pass_sync_tests.cpp sync_tracker_tests.cpp gpu_caps_tests.cpp render_pass_policy_tests.cpp pipeline_cache_file_tests.cpp gpu_policy_golden_tests.cpp
+    "${CORE_ROOT}/vkutil/src/vkutil.cpp" "${CORE_ROOT}/vkutil/src/sync_tracker.cpp")
 target_include_directories(render_sync_host_tests PRIVATE ${SS_INCLUDES})
 target_compile_definitions(render_sync_host_tests PRIVATE ${SS_DEFINES})
 set_target_properties(render_sync_host_tests PROPERTIES CXX_STANDARD 23)
 target_link_libraries(render_sync_host_tests PRIVATE gtest_host boost_fs_host ss_third_party_host)
 target_link_options(render_sync_host_tests PRIVATE -static -Wl,/force:unresolved)
+
+# Buildout host tests: P7 colour format model, P8 visibility, P12 transfers, P15 rasteriser odds (header-only models).
+# Build and run with run-core-host-tests.ps1 -Target buildout_host_tests.
+add_executable(buildout_host_tests EXCLUDE_FROM_ALL
+    colour_format_tests.cpp visibility_model_tests.cpp raster_model_tests.cpp transfer_model_tests.cpp buffer_store_model_tests.cpp "${CORE_ROOT}/vkutil/src/vkutil.cpp")
+target_include_directories(buildout_host_tests PRIVATE ${SS_INCLUDES})
+target_compile_definitions(buildout_host_tests PRIVATE ${SS_DEFINES})
+set_target_properties(buildout_host_tests PROPERTIES CXX_STANDARD 23)
+target_link_libraries(buildout_host_tests PRIVATE gtest_host boost_fs_host ss_third_party_host)
+target_link_options(buildout_host_tests PRIVATE -static -Wl,/force:unresolved)

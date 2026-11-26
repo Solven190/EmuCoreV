@@ -257,8 +257,6 @@
     <string name="settings_cpu_pool_size">Розмір пулу CPU</string>
     <string name="settings_help_cpu_pool_size">Задає кількість робочих потоків, які використовує емулятор.\n\nВикористовуйте це, коли гра гальмує, підлагує або пристрій має запас CPU/GPU. Вимкніть або зменште значення, якщо з’являються вильоти, тріск звуку, нагрів, швидкий розряд батареї або ламається таймінг.</string>
     <string name="settings_cpu_pool_size_value">Потоків: %1$d</string>
-    <string name="settings_hashless_texture_cache">Кеш текстур без хешування</string>
-    <string name="settings_help_hashless_texture_cache">Використовує більш агресивний режим кешування текстур.\n\nВикористовуйте це, щоб зменшити статер шейдерів або текстур після першого запуску. Вимикайте лише якщо гра показує зіпсовані текстури, чорний екран або повторювані вильоти після кешування.</string>
     <string name="settings_shader_cache">Кеш шейдерів</string>
     <string name="settings_help_shader_cache">Зберігає скомпільовані шейдери між запусками для зменшення статерів.\n\nВикористовуйте це, щоб зменшити статер шейдерів або текстур після першого запуску. Вимикайте лише якщо гра показує зіпсовані текстури, чорний екран або повторювані вильоти після кешування.</string>
     <string name="settings_pixel_perfect_fullscreen">Ідеальний повноекранний режим</string>
@@ -1488,6 +1486,9 @@
     <string name="emulation_savestate_loaded_toast">Завантажено</string>
     <string name="emulation_savestate_deleted_toast">Видалено</string>
     <string name="emulation_savestate_failed_toast">Не вдалося виконати дію</string>
+    <string name="emulation_savestate_other_version_toast">Цей стан збереження створено іншою версією застосунку, тому його не можна завантажити. Файл збережено.</string>
+    <string name="emulation_savestate_other_version_boot_toast">Швидке збереження створено іншою версією застосунку, тому його не можна завантажити. Гра запускається звичайно; файл збережено.</string>
+    <string name="emulation_savestate_vulkan_only">Збереження стану працюють лише з рендерером Vulkan</string>
     <string name="emulation_savestate_refused_no_game">Гру не запущено, стан зберегти неможливо</string>
     <string name="emulation_savestate_refused_exiting">Гра закривається, повторіть пізніше</string>
     <string name="emulation_savestate_refused_loading">Гра ще завантажується, повторіть за мить</string>

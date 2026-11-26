@@ -17,6 +17,8 @@
 
 #include <renderer/vulkan/gxm_to_vulkan.h>
 
+#include <renderer/sampler_state.h>
+
 #include <gxm/functions.h>
 #include <util/log.h>
 
@@ -113,11 +115,21 @@ vk::BlendFactor translate_blend_factor(const SceGxmBlendFactor blend_factor) {
     case SCE_GXM_BLEND_FACTOR_SRC_ALPHA_SATURATE:
         return vk::BlendFactor::eSrcAlphaSaturate;
     case SCE_GXM_BLEND_FACTOR_DST_ALPHA_SATURATE:
-        return vk::BlendFactor::eDstAlpha; // TODO Not supported.
+        // PROVISIONAL: the saturate factor is a min() of two alphas, which fixed-function blending cannot express for
+        // the destination variant (the source variant maps to eSrcAlphaSaturate). The colour factor is approximated by
+        // the destination alpha; the alpha channel factor is exact, see translate_blend_factor_alpha.
+        return vk::BlendFactor::eDstAlpha;
     default:
         LOG_ERROR("Unknown blend factor: {}", fmt::underlying(blend_factor));
         return vk::BlendFactor::eOne;
     }
+}
+
+vk::BlendFactor translate_blend_factor_alpha(const SceGxmBlendFactor blend_factor) {
+    // the alpha component of both saturate factors is one: (f, f, f, 1)
+    if (blend_factor == SCE_GXM_BLEND_FACTOR_DST_ALPHA_SATURATE)
+        return vk::BlendFactor::eOne;
+    return translate_blend_factor(blend_factor);
 }
 
 vk::BlendOp translate_blend_func(const SceGxmBlendFunc blend_func) {
@@ -151,8 +163,8 @@ vk::PrimitiveTopology translate_primitive(SceGxmPrimitiveType primitive) {
         return vk::PrimitiveTopology::eLineList;
     case SCE_GXM_PRIMITIVE_POINTS:
         return vk::PrimitiveTopology::ePointList;
-    case SCE_GXM_PRIMITIVE_TRIANGLE_EDGES: // Todo: Implement this
-        LOG_WARN("Unsupported primitive: SCE_GXM_PRIMITIVE_TRIANGLE_EDGES, using SCE_GXM_PRIMITIVE_TRIANGLES instead");
+    case SCE_GXM_PRIMITIVE_TRIANGLE_EDGES:
+        // the edges of the triangles: a triangle list rasterised as lines (the pipeline sets the polygon mode)
         return vk::PrimitiveTopology::eTriangleList;
     default:
         LOG_ERROR("Unknown primitive: {}", fmt::underlying(primitive));
@@ -920,24 +932,25 @@ vk::Format translate_format(SceGxmTextureBaseFormat base_format) {
     }
 }
 
-vk::SamplerAddressMode translate_address_mode(SceGxmTextureAddrMode src) {
-    switch (src) {
-    case SCE_GXM_TEXTURE_ADDR_REPEAT:
-        return vk::SamplerAddressMode::eRepeat;
-    case SCE_GXM_TEXTURE_ADDR_MIRROR:
-        return vk::SamplerAddressMode::eMirroredRepeat;
-    case SCE_GXM_TEXTURE_ADDR_CLAMP:
-        return vk::SamplerAddressMode::eClampToEdge;
-    case SCE_GXM_TEXTURE_ADDR_MIRROR_CLAMP:
-        return vk::SamplerAddressMode::eMirrorClampToEdge;
-    case SCE_GXM_TEXTURE_ADDR_REPEAT_IGNORE_BORDER:
-    case SCE_GXM_TEXTURE_ADDR_CLAMP_FULL_BORDER:
-    case SCE_GXM_TEXTURE_ADDR_CLAMP_IGNORE_BORDER:
-    case SCE_GXM_TEXTURE_ADDR_CLAMP_HALF_BORDER:
-        LOG_ERROR_ONCE("Unhandled border color address mode, texture will be corrupted. Please report it to the developers.");
-        return (src == SCE_GXM_TEXTURE_ADDR_REPEAT_IGNORE_BORDER) ? vk::SamplerAddressMode::eRepeat : vk::SamplerAddressMode::eClampToBorder;
-    default:
+vk::SamplerAddressMode translate_address_mode(SceGxmTextureAddrMode src, bool mirror_clamp_supported) {
+    if (src > SCE_GXM_TEXTURE_ADDR_CLAMP_HALF_BORDER)
         LOG_ERROR("Unknown address mode {}", log_hex(src));
+
+    const AddressTranslation translation = translate_address(src, mirror_clamp_supported);
+    if (translation.approximate)
+        LOG_WARN_ONCE("GXM texture address mode {} is approximated (clamp / border semantics, see renderer/sampler_state.h)", log_hex(src));
+
+    switch (translation.kind) {
+    case AddressKind::Repeat:
+        return vk::SamplerAddressMode::eRepeat;
+    case AddressKind::MirroredRepeat:
+        return vk::SamplerAddressMode::eMirroredRepeat;
+    case AddressKind::MirrorClampToEdge:
+        return vk::SamplerAddressMode::eMirrorClampToEdge;
+    case AddressKind::ClampToBorder:
+        return vk::SamplerAddressMode::eClampToBorder;
+    case AddressKind::ClampToEdge:
+    default:
         return vk::SamplerAddressMode::eClampToEdge;
     }
 }
