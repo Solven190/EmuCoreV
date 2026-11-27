@@ -355,7 +355,6 @@
     <string name="settings_frame_limit">Frame rate limit</string>
     <string name="settings_frame_limit_unlimited">Unlimited</string>
     <string name="settings_core_vsync">Vertical sync</string>
-    <string name="settings_core_high_accuracy">High accuracy GPU mode</string>
     <string name="settings_core_resolution_label">Resolution multiplier</string>
     <string name="settings_core_resolution_value">%1$.2fx render scale</string>
     <string name="settings_core_overlay_opacity_label">Overlay opacity</string>
@@ -464,7 +463,6 @@
     <string name="settings_help_fps_hack">Removes the normal frame limit in some games. It can improve speed, but it may break timing.\n\nUse this for testing, skipping slow sections, or working around a game-specific behavior. Avoid it for normal gameplay when timing, physics, cutscenes, or online-style checks need to stay accurate.</string>
     <string name="settings_help_frame_limit">Limits presented frames without changing the emulated Vita timing. Use 30 or 45 FPS to reduce power use and heat.</string>
     <string name="settings_help_vsync">Reduces screen tearing, but may lower performance in some games.\n\nUse this to improve image clarity, scaling, or visual stability in games that already run well. Reduce it or restore the default if FPS drops, the phone heats up, or graphics become unstable.</string>
-    <string name="settings_help_high_accuracy">Can fix graphics issues, but usually reduces performance.\n\nUse this to improve image clarity, scaling, or visual stability in games that already run well. Reduce it or restore the default if FPS drops, the phone heats up, or graphics become unstable.</string>
     <string name="settings_help_resolution">Higher values make the image sharper, but use more GPU power.\n\nUse this to improve image clarity, scaling, or visual stability in games that already run well. Reduce it or restore the default if FPS drops, the phone heats up, or graphics become unstable.</string>
     <string name="settings_help_renderer">Vulkan is usually the best choice. OpenGL can help on devices with weak Vulkan support.\n\nVulkan is usually the best choice for speed and modern Android drivers. Try OpenGL only when Vulkan fails to boot, shows broken graphics, or your device has poor Vulkan support.</string>
     <string name="settings_help_screen_filter">Bilinear smooths the image. Nearest keeps sharper edges.\n\nUse this to improve image clarity, scaling, or visual stability in games that already run well. Reduce it or restore the default if FPS drops, the phone heats up, or graphics become unstable.</string>
@@ -1105,7 +1103,6 @@
     <string name="settings_gpu_driver_compatibility_a6xx">Adreno 6xx: Snapdragon 845/855/865/888 and many Snapdragon 6/7 series</string>
     <string name="settings_gpu_driver_compatibility_a7xx">Adreno 7xx: Snapdragon 8 Gen 1/2/3, 8s Gen 3, 7 Gen 3/4, 7+ Gen 2/3, and 6 Gen 1/3</string>
     <string name="settings_gpu_driver_compatibility_a8xx">Adreno 8xx: Snapdragon 8 Elite Extreme Gen 6, 8 Elite Gen 6, 8 Gen 6, 8 Elite Gen 5, 8 Gen 5, 8s Gen 4, 7s Gen 3/4, and 6 Gen 4</string>
-    <string name="game_manager_db_recommendation">Game DB recommends %1$s / %2$s for this game. You can change either option; saved per-game settings take priority.</string>
     <string name="emulation_ime_done">Done</string>
     <string name="emulation_ime_system">Android keyboard</string>
     <string name="emulation_ime_builtin">Built-in keyboard</string>

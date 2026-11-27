@@ -639,7 +639,11 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
 
                 pa_iter_var = b.createBinOp(spv::OpFDiv, v4, pa_iter_var, res_multiplier);
             } else {
-                spv::Decoration precision = (get_data_type_size(pa_dtype) < 4 && !features.force_full_precision) ? spv::DecorationRelaxedPrecision : spv::NoPrecision;
+                // Texture coordinate iterators: provisional rule (needs on-device A/B, see docs/image-quality-review.md).
+                // A mediump UV varying is quantised to 10 mantissa bits on GPUs that honour RelaxedPrecision, which
+                // makes large textures swim/shimmer in motion; keep them full precision regardless of the declared type.
+                const bool is_texcoord_iterator = input_id <= 0x9000;
+                spv::Decoration precision = (get_data_type_size(pa_dtype) < 4 && !features.force_full_precision && !is_texcoord_iterator) ? spv::DecorationRelaxedPrecision : spv::NoPrecision;
                 pa_iter_var = create_fragment_iterator(b, translation_state, precision, pa_iter_type, pa_name.c_str(), pa_loc);
             }
 
@@ -1227,7 +1231,6 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
     }
 
     const uint16_t buffer_count = buffer_sizes.empty() ? 0 : (buffer_sizes.rbegin()->first + 1);
-    const uint16_t texture_count = std::bit_width(gxp::get_textures_used(program).to_ulong());
 
     int last_base = 0;
     int total_members = 0;
@@ -1282,25 +1285,16 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
     const spv::Id v4 = b.makeVectorType(f32, 4);
     const spv::Id u32 = b.makeUintType(32);
     const spv::Id uvec2 = b.makeVectorType(u32, 2);
-    const spv::Id vec2 = b.makeVectorType(f32, 2);
     spv::Id buffer_addresses_type = 0;
     if (buffer_count > 0) {
         buffer_addresses_type = b.makeArrayType(uvec2, b.makeUintConstant(buffer_count), 0);
         // we are using the standard layout, so only an 8-bytes stride
         b.addDecoration(buffer_addresses_type, spv::DecorationArrayStride, 8);
     }
-    spv::Id viewport_fields_type = 0;
-    if (texture_count > 0) {
-        viewport_fields_type = b.makeArrayType(vec2, b.makeUintConstant(texture_count), 0);
-        // we are using the standard layout, so only an 8-bytes stride
-        b.addDecoration(viewport_fields_type, spv::DecorationArrayStride, 8);
-    }
-
     spv::Id render_buf_type;
     int curr_field_id = 0;
 
     const uint16_t uniform_buffer_count = features.enable_memory_mapping ? buffer_count : 0;
-    const uint16_t uniform_texture_count = features.use_texture_viewport ? texture_count : 0;
 
     spv_params.buffer_count = uniform_buffer_count;
 
@@ -1309,10 +1303,6 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
         std::vector<spv::Id> uniform_composition = { v4, f32, f32, f32, f32, f32, f32 };
         if (uniform_buffer_count > 0)
             uniform_composition.push_back(buffer_addresses_type);
-        if (uniform_texture_count > 0) {
-            uniform_composition.push_back(viewport_fields_type);
-            uniform_composition.push_back(viewport_fields_type);
-        }
 
         render_buf_type = b.makeStructType(uniform_composition, "GxmRenderVertBufferBlock");
         b.addDecoration(render_buf_type, spv::DecorationBlock);
@@ -1335,15 +1325,11 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
 #undef ADD_VERT_UNIFORM_MEMBER
 #define ADD_EXT_UNIFORM_MEMBER(name)                                                                                                                                                \
     spv_params.name##_id = curr_field_id;                                                                                                                                           \
-    b.addMemberDecoration(render_buf_type, curr_field_id, spv::DecorationOffset, RenderVertUniformBlockExtended::get_##name##_offset(uniform_buffer_count, uniform_texture_count)); \
+    b.addMemberDecoration(render_buf_type, curr_field_id, spv::DecorationOffset, RenderVertUniformBlockExtended::get_##name##_offset(uniform_buffer_count)); \
     b.addMemberName(render_buf_type, curr_field_id++, #name)
 
         if (uniform_buffer_count > 0) {
             ADD_EXT_UNIFORM_MEMBER(buffer_addresses);
-        }
-        if (uniform_texture_count > 0) {
-            ADD_EXT_UNIFORM_MEMBER(viewport_ratio);
-            ADD_EXT_UNIFORM_MEMBER(viewport_offset);
         }
 
 #undef ADD_EXT_UNIFORM_MEMBER
@@ -1359,10 +1345,6 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
         std::vector<spv::Id> uniform_composition = { f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32 };
         if (uniform_buffer_count > 0)
             uniform_composition.push_back(buffer_addresses_type);
-        if (uniform_texture_count > 0) {
-            uniform_composition.push_back(viewport_fields_type);
-            uniform_composition.push_back(viewport_fields_type);
-        }
 
         render_buf_type = b.makeStructType(uniform_composition, "GxmRenderFragBufferBlock");
 
@@ -1396,15 +1378,11 @@ static SpirvShaderParameters create_parameters(spv::Builder &b, const SceGxmProg
 
 #define ADD_EXT_UNIFORM_MEMBER(name)                                                                                                                                                \
     spv_params.name##_id = curr_field_id;                                                                                                                                           \
-    b.addMemberDecoration(render_buf_type, curr_field_id, spv::DecorationOffset, RenderFragUniformBlockExtended::get_##name##_offset(uniform_buffer_count, uniform_texture_count)); \
+    b.addMemberDecoration(render_buf_type, curr_field_id, spv::DecorationOffset, RenderFragUniformBlockExtended::get_##name##_offset(uniform_buffer_count)); \
     b.addMemberName(render_buf_type, curr_field_id++, #name)
 
         if (uniform_buffer_count > 0) {
             ADD_EXT_UNIFORM_MEMBER(buffer_addresses);
-        }
-        if (uniform_texture_count > 0) {
-            ADD_EXT_UNIFORM_MEMBER(viewport_ratio);
-            ADD_EXT_UNIFORM_MEMBER(viewport_offset);
         }
 
 #undef ADD_EXT_UNIFORM_MEMBER
@@ -1983,17 +1961,18 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
     o_op.num = 0;
     o_op.swizzle = SWIZZLE_CHANNEL_4_DEFAULT;
 
-    // gl_ClipDistance carries the two eye-plane guards first, then whatever clip planes the program declares
+    // gl_ClipDistance carries the three depth range guards first (renderer gpu_caps.h DepthRangePath::ClampClipDistance),
+    // then whatever clip planes the program declares
     // the guards are derived from the position output, so without one there is nothing to guard
     const bool emit_eye_clip = translation_state.is_vulkan && features.support_clip_distance && (vertex_outputs & SCE_GXM_VERTEX_PROGRAM_OUTPUT_POSITION);
-    const uint32_t eye_clip_count = emit_eye_clip ? 2 : 0;
+    const uint32_t eye_clip_count = emit_eye_clip ? 3 : 0;
     uint32_t gxm_clip_count = 0;
     if (translation_state.is_vulkan && features.support_gxm_clip_planes) {
         for (uint32_t i = 0; i < 8; i++) {
             if (vertex_outputs & (SCE_GXM_VERTEX_PROGRAM_OUTPUT_CLIP0 << i))
                 gxm_clip_count++;
         }
-        // Vulkan only guarantees eight clip distances and the eye-plane guards already claim two
+        // Vulkan only guarantees eight clip distances and the depth range guards already claim three
         if (eye_clip_count + gxm_clip_count > 8) {
             LOG_WARN("Vertex program declares {} clip planes, only {} can be translated", gxm_clip_count, 8 - eye_clip_count);
             gxm_clip_count = 8 - eye_clip_count;
@@ -2125,12 +2104,12 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
                     z = b.createBinOp(spv::OpFMul, f32, z, z_scale);
                     z = b.createBinOp(spv::OpFAdd, f32, z, z_offset);
 
-                    // z values below 0 get clamped
-                    // z = b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450FMax, { z, zero });      // Nick causes bad clamping - should be removed
-
-                    // Per-fragment depth clamping is handled by depthClampEnable (Vulkan)
-                    // or GL_ARB_depth_clamp (OpenGL), matching PowerVR hardware behavior.
-                    // Per-vertex clamping here would warp the triangle's depth plane equation.
+                    // The Vita never clips at the near plane in depth (renderer gpu_caps.h DepthRangePath). With depth clamp
+                    // (clip distances or the fragment discard) the pipeline clamps per fragment; otherwise (no depth clamp, or
+                    // OpenGL) depth is clamped here per vertex so the rasteriser's near plane never cuts. The far plane is
+                    // clipped by the rasteriser in that tier.
+                    if (!emit_eye_clip && !(translation_state.is_vulkan && features.fragment_depth_clip))
+                        z = b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450FMax, { z, b.makeFloatConstant(0.0f) });
 
                     if (!translation_state.is_vulkan) {
                         // convert [0,1] depth range (gxp, vulkan) to [-1,1] depth range (opengl)
@@ -2146,9 +2125,10 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
 
                 cond_builder.makeEndIf();
 
-                // depth clamp disables z-clipping, so clip eye-plane-crossing primitives ourselves:
+                // depth clamp disables z-clipping, so clip what the Vita clips ourselves:
                 // [0] w <= 0 is behind the eye; [1] z/w < -1 kills the near-infinity wedge that
-                // survives an exact w=0 clip (clamped-z geometry like KZ sits at z/w ~ -0.001)
+                // survives an exact w=0 clip (clamped-z geometry like KZ sits at z/w ~ -0.001);
+                // [2] z/w > 1 is beyond the far plane (Stealth Inc hides its room covers there)
                 if (emit_eye_clip) {
                     const spv::Id clip_z_ref = utils::create_access_chain(b, spv::StorageClassOutput, out_var, { b.makeIntConstant(2) });
                     const spv::Id clip_w_ref = utils::create_access_chain(b, spv::StorageClassOutput, out_var, { b.makeIntConstant(3) });
@@ -2160,6 +2140,8 @@ static spv::Function *make_vert_finalize_function(spv::Builder &b, const SpirvSh
                     const spv::Id on_eye_plane = b.createBinOp(spv::OpLogicalAnd, bool_type, b.createBinOp(spv::OpFOrdEqual, bool_type, clip_w, zero), b.createUnaryOp(spv::OpLogicalNot, bool_type, pred));
                     b.createStore(b.createTriOp(spv::OpSelect, f32, on_eye_plane, b.makeFloatConstant(-std::numeric_limits<float>::min()), clip_w), clip_dist0_ref);
                     b.createStore(b.createBinOp(spv::OpFAdd, f32, clip_z, clip_w), clip_dist1_ref);
+                    const spv::Id clip_dist2_ref = utils::create_access_chain(b, spv::StorageClassOutput, clip_var, { b.makeIntConstant(2) });
+                    b.createStore(b.createBinOp(spv::OpFSub, f32, clip_w, clip_z), clip_dist2_ref);
                 }
             } else if (vo == SCE_GXM_VERTEX_PROGRAM_OUTPUT_PSIZE) {
                 b.addDecoration(out_var, spv::DecorationBuiltIn, spv::BuiltInPointSize);
@@ -2249,6 +2231,31 @@ static spv::Function *make_frag_initialize_function(spv::Builder &b, Translation
     b.setBuildPoint(last_build_point);
 
     return frag_init_func;
+}
+
+// Depth range tier FragmentDiscard (renderer gpu_caps.h DepthRangePath): the pipeline clamps depth, which turns off z-clipping, and
+// there are no clip distances, so drop what the Vita clips here. gl_FragCoord.z is the interpolated depth before the depth-test clamp
+// and the viewport depth range is always [0, 1]: z > 1 is beyond the far plane, z < -1 is the near-infinity wedge (see the eye clip
+// guards in make_vert_finalize_function).
+static spv::Function *make_frag_depth_clip_function(spv::Builder &b, TranslationState &translate_state) {
+    std::vector<std::vector<spv::Decoration>> decorations;
+    spv::Block *block;
+    spv::Block *last_build_point = b.getBuildPoint();
+    spv::Function *func = b.makeFunctionEntry(spv::NoPrecision, b.makeVoidType(), "frag_depth_clip", {}, {}, decorations, &block);
+
+    const spv::Id f32 = b.makeFloatType(32);
+    const spv::Id bool_type = b.makeBoolType();
+    const spv::Id z = b.createCompositeExtract(b.createLoad(translate_state.frag_coord_id, spv::NoPrecision), f32, 2);
+    const spv::Id clipped = b.createBinOp(spv::OpLogicalOr, bool_type,
+        b.createBinOp(spv::OpFOrdGreaterThan, bool_type, z, b.makeFloatConstant(1.0f)),
+        b.createBinOp(spv::OpFOrdLessThan, bool_type, z, b.makeFloatConstant(-1.0f)));
+    spv::Builder::If clip_cond(clipped, spv::SelectionControlMaskNone, b);
+    b.makeStatementTerminator(spv::OpKill, "depth_clip");
+    clip_cond.makeEndIf();
+
+    b.makeReturn(false);
+    b.setBuildPoint(last_build_point);
+    return func;
 }
 
 static void generate_update_mask_body(spv::Builder &b, TranslationState &translate_state) {
@@ -2425,6 +2432,8 @@ static SpirvCode convert_gxp_to_spirv_impl(const SceGxmProgram &program, const s
         if (program.is_fragment()) {
             if (!translation_state.is_vulkan)
                 begin_hook_func = make_frag_initialize_function(b, translation_state);
+            else if (features.fragment_depth_clip && translation_state.frag_coord_id != spv::NoResult)
+                begin_hook_func = make_frag_depth_clip_function(b, translation_state);
 
             end_hook_func = make_frag_finalize_function(b, parameters, program, utils, features, translation_state);
         } else {

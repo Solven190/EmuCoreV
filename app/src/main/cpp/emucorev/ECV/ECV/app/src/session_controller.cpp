@@ -18,7 +18,9 @@
 #include <app/functions.h>
 #include <app/session_controller.h>
 
+#include <audio/in_settings.h>
 #include <audio/state.h>
+#include <camera/camera.h>
 #include <ctrl/state.h>
 #include <display/functions.h>
 #include <display/state.h>
@@ -138,6 +140,10 @@ bool AppSessionController::load_and_run(bool restore_state) {
     emuenv.renderer->set_app(emuenv.io.title_id.c_str(), emuenv.self_name.c_str());
     prepare_game_launch_overlay(emuenv);
 
+    // Games lock their 60 Hz vblank to the panel vsync (while v-sync is on); the native shell and
+    // trophy apps run their own refresh handling.
+    emuenv.display.follow_panel_vsync = !is_native_library(active_launch_request) && !is_native_trophies(active_launch_request);
+
     if (restore_state) {
         // Load reconstructs every guest thread and module from the snapshot.
         // Starting a fresh main thread first can leave it waiting for a module
@@ -244,6 +250,12 @@ void AppSessionController::stop(const AppSessionStopReason reason) {
         active_frame_host->get().destroy_render_context();
 
     emuenv.motion.clear_device_motion_support();
+
+    // Host peripheral suspension (menu pause / background) belongs to the stopped
+    // session: a game quit from the pause menu left the camera and microphone
+    // suspended for the next one (B151). The next activity re-asserts its own state.
+    ecv_camera_set_host_suspended(false);
+    ecv_audio_in::settings().suspended.store(false);
 
     {
         std::lock_guard<std::mutex> lock(mutex);

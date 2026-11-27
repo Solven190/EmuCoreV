@@ -39,6 +39,7 @@ struct ThreadState;
 extern thread_local ThreadState *g_tls_guest_thread;
 
 void guest_sched_set_cores(int cores);
+void guest_sched_reset_process();
 void guest_sched_release_for_block();
 void guest_sched_forget_cpu(CPUState *cpu);
 CPUState *guest_sched_token_cpu();
@@ -127,6 +128,8 @@ struct ThreadState {
     [[nodiscard]] WaitResult wait(WaitTarget target, Deadline deadline, bool callbacks);
     // Wakes this thread from wait().
     void wake();
+    // wake() that gives up instead of waiting for the thread's state lock (callers that must not block, e.g. the audio device thread).
+    bool try_wake();
 
     // Runs the notified callbacks of this thread and returns how many ran. Called by the thread itself.
     SceUInt32 process_callbacks();

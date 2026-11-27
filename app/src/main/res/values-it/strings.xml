@@ -151,7 +151,6 @@
     <string name="settings_frame_limit">Limite frequenza fotogrammi</string>
     <string name="settings_frame_limit_unlimited">Illimitato</string>
     <string name="settings_core_vsync">Sincronizzazione verticale (V-Sync)</string>
-    <string name="settings_core_high_accuracy">Modalità GPU ad alta precisione</string>
     <string name="settings_core_resolution_label">Moltiplicatore di risoluzione</string>
     <string name="settings_core_resolution_value">Scala di rendering %1$.2fx</string>
     <string name="settings_core_overlay_opacity_label">Opacità sovrimpressione</string>
@@ -198,7 +197,6 @@
     <string name="settings_help_fps_hack">Rimuove il normale limite di frame in alcuni giochi. Può migliorare la velocità, ma potrebbe alterare il timing.\n\nUsalo per test, per saltare sezioni lente o per aggirare comportamenti specifici di un gioco. Evitalo nel gameplay normale quando timing, fisica, filmati o controlli devono restare accurati.</string>
     <string name="settings_help_frame_limit">Limita i fotogrammi visualizzati senza modificare il timing della Vita emulata. Usa 30 o 45 FPS per ridurre il consumo energetico e il calore.</string>
     <string name="settings_help_vsync">Riduce il tearing dello schermo, ma in alcuni giochi potrebbe diminuire le prestazioni.\n\nUsalo per migliorare nitidezza, scaling o stabilità visiva nei giochi che già funzionano bene. Riducilo o torna al valore predefinito se calano gli FPS, il telefono scalda o la grafica diventa instabile.</string>
-    <string name="settings_help_high_accuracy">Può risolvere problemi grafici, ma di solito riduce le prestazioni.\n\nUsalo per migliorare nitidezza, scaling o stabilità visiva nei giochi che già funzionano bene. Riducilo o torna al valore predefinito se calano gli FPS, il telefono scalda o la grafica diventa instabile.</string>
     <string name="settings_help_resolution">Valori più alti rendono l\'immagine più nitida, ma utilizzano più potenza della GPU.\n\nUsalo per migliorare nitidezza, scaling o stabilità visiva nei giochi che già funzionano bene. Riducilo o torna al valore predefinito se calano gli FPS, il telefono scalda o la grafica diventa instabile.</string>
     <string name="settings_help_renderer">Vulkan è solitamente la scelta migliore. OpenGL può aiutare su dispositivi con scarso supporto Vulkan.\n\nVulkan di solito è la scelta migliore per velocità e driver Android moderni. Prova OpenGL solo se Vulkan non avvia il gioco, mostra grafica rotta o il dispositivo supporta male Vulkan.</string>
     <string name="settings_help_screen_filter">Bilineare ammorbidisce l\'immagine. Più vicino mantiene bordi più netti.\n\nUsalo per migliorare nitidezza, scaling o stabilità visiva nei giochi che già funzionano bene. Riducilo o torna al valore predefinito se calano gli FPS, il telefono scalda o la grafica diventa instabile.</string>
@@ -1116,7 +1114,6 @@
     <string name="settings_gpu_driver_compatibility_a6xx">Adreno 6xx: Snapdragon 845/855/865/888 e molti modelli Snapdragon serie 6/7</string>
     <string name="settings_gpu_driver_compatibility_a7xx">Adreno 7xx: Snapdragon 8 Gen 1/2/3, 8s Gen 3, 7 Gen 3/4, 7+ Gen 2/3 e 6 Gen 1/3</string>
     <string name="settings_gpu_driver_compatibility_a8xx">Adreno 8xx: Snapdragon 8 Elite Extreme Gen 6, 8 Elite Gen 6, 8 Gen 6, 8 Elite Gen 5, 8 Gen 5, 8s Gen 4, 7s Gen 3/4 e 6 Gen 4</string>
-    <string name="game_manager_db_recommendation">Game DB consiglia %1$s / %2$s per questo gioco. Puoi modificare entrambe le opzioni; le impostazioni salvate del gioco hanno la priorità.</string>
     <string name="emulation_ime_done">Fine</string>
     <string name="emulation_ime_system">Tastiera Android</string>
     <string name="emulation_ime_builtin">Tastiera integrata</string>

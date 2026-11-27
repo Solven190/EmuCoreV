@@ -274,7 +274,6 @@
     <string name="settings_frame_limit">حد معدل الإطارات</string>
     <string name="settings_frame_limit_unlimited">بدون حد</string>
     <string name="settings_core_vsync">المزامنة الرأسية (V-Sync)</string>
-    <string name="settings_core_high_accuracy">وضع دقة GPU العالية</string>
     <string name="settings_core_resolution_label">مضاعف الدقة</string>
     <string name="settings_core_resolution_value">مقياس التصيير %1$.2fx</string>
     <string name="settings_core_overlay_opacity_label">شفافية التراكب</string>
@@ -357,7 +356,6 @@
     <string name="settings_help_fps_hack">يزيل حد الإطارات الطبيعي في بعض الألعاب. يمكن أن يحسن السرعة، لكنه قد يكسر التوقيت.\n\nاستخدم هذا للاختبار، أو تخطي الأقسام البطيئة، أو حل سلوك خاص بلعبة معينة. تجنبه للعب العادي عندما تحتاج التوقيتات، والفيزياء، والمشاهد السينمائية، أو الشيكات عبر الإنترنت إلى البقاء دقيقة.</string>
     <string name="settings_help_frame_limit">يحد من عدد الإطارات المعروضة دون تغيير توقيت Vita المحاكى. استخدم 30 أو 45 FPS لتقليل استهلاك الطاقة والحرارة.</string>
     <string name="settings_help_vsync">يقلل من تمزق الشاشة، ولكنه قد يقلل من الأداء في بعض الألعاب.\n\nاستخدم هذا لتحسين وضوح الصورة أو التوسع أو الاستقرار البصري في الألعاب التي تعمل بشكل جيد بالفعل. قم بتقليله أو استعادة الافتراضي إذا انخفض معدل الإطارات، أو ارتفعت حرارة الهاتف، أو أصبحت الرسومات غير مستقرة.</string>
-    <string name="settings_help_high_accuracy">يمكنه إصلاح مشاكل الرسومات، لكنه عادة ما يقلل من الأداء.\n\nاستخدم هذا لتحسين وضوح الصورة أو التوسع أو الاستقرار البصري في الألعاب التي تعمل بشكل جيد بالفعل. قم بتقليله أو استعادة الافتراضي إذا انخفض معدل الإطارات، أو ارتفعت حرارة الهاتف، أو أصبحت الرسومات غير مستقرة.</string>
     <string name="settings_help_resolution">القيم الأعلى تجعل الصورة أكثر حدة، ولكنها تستخدم طاقة وحدة معالجة الرسومات (GPU) أكثر.\n\nاستخدم هذا لتحسين وضوح الصورة أو التوسع أو الاستقرار البصري في الألعاب التي تعمل بشكل جيد بالفعل. قم بتقليله أو استعادة الافتراضي إذا انخفض معدل الإطارات، أو ارتفعت حرارة الهاتف، أو أصبحت الرسومات غير مستقرة.</string>
     <string name="settings_help_renderer">عادةً ما يكون Vulkan هو الخيار الأفضل. يمكن أن يساعد OpenGL على الأجهزة ذات الدعم الضعيف لـ Vulkan.\n\nيعتبر Vulkan الخيار الأفضل عادةً للسرعة وتعريفات Android الحديثة. جرب OpenGL فقط عندما يفشل Vulkan في الإقلاع، أو يُظهر رسومات مكسورة، أو إذا كان جهازك يتمتع بدعم ضعيف لـ Vulkan.</string>
     <string name="settings_help_screen_filter">يقوم Bilinear بتنعيم الصورة. يحافظ Nearest على الحواف الأكثر حدة.\n\nاستخدم هذا لتحسين وضوح الصورة أو التوسع أو الاستقرار البصري في الألعاب التي تعمل بشكل جيد بالفعل. قم بتقليله أو استعادة الافتراضي إذا انخفض معدل الإطارات، أو ارتفعت حرارة الهاتف، أو أصبحت الرسومات غير مستقرة.</string>
@@ -1119,7 +1117,6 @@
     <string name="settings_gpu_driver_compatibility_a6xx">Adreno 6xx: ‏Snapdragon 845/855/865/888 والعديد من طرز سلسلتي Snapdragon 6/7</string>
     <string name="settings_gpu_driver_compatibility_a7xx">Adreno 7xx: ‏Snapdragon 8 Gen 1/2/3 و8s Gen 3 و7 Gen 3/4 و7+ Gen 2/3 و6 Gen 1/3</string>
     <string name="settings_gpu_driver_compatibility_a8xx">Adreno 8xx: ‏Snapdragon 8 Elite Extreme Gen 6 و8 Elite Gen 6 و8 Gen 6 و8 Elite Gen 5 و8 Gen 5 و8s Gen 4 و7s Gen 3/4 و6 Gen 4</string>
-    <string name="game_manager_db_recommendation">توصي Game DB باستخدام %1$s / %2$s لهذه اللعبة. يمكنك تغيير الخيارين؛ إعدادات اللعبة المحفوظة لها الأولوية.</string>
     <string name="emulation_ime_done">تم</string>
     <string name="emulation_ime_system">لوحة مفاتيح Android</string>
     <string name="emulation_ime_builtin">لوحة مفاتيح مدمجة</string>

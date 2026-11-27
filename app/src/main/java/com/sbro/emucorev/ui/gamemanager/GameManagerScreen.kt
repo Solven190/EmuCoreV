@@ -82,7 +82,6 @@ import com.sbro.emucorev.core.GpuDriverCompatibility
 import com.sbro.emucorev.ui.settings.gpuDriverSelectionSummary
 import com.sbro.emucorev.core.InstalledGpuDriver
 import com.sbro.emucorev.core.VitaCoreConfig
-import com.sbro.emucorev.core.GameGpuRecommendation
 import com.sbro.emucorev.data.InstalledVitaGame
 import com.sbro.emucorev.ui.common.LocalImage
 import com.sbro.emucorev.ui.common.GameCoverArt
@@ -203,7 +202,6 @@ fun GameManagerScreen(
                         titleId = uiState.selectedTitleId,
                         config = uiState.config,
                         device = device,
-                        gameDbRecommendation = uiState.gameDbRecommendation,
                         defaults = uiState.defaults,
                         installedGpuDrivers = uiState.installedGpuDrivers,
                         customDriverOverride = uiState.customDriverOverride,
@@ -480,7 +478,6 @@ private fun GraphicsProfileSection(
     titleId: String?,
     config: VitaCoreConfig,
     device: DeviceGpuSnapshot,
-    gameDbRecommendation: GameGpuRecommendation?,
     defaults: VitaCoreConfig,
     installedGpuDrivers: List<InstalledGpuDriver>,
     customDriverOverride: String?,
@@ -489,18 +486,6 @@ private fun GraphicsProfileSection(
     onDriverOverrideSelected: (String?) -> Unit
 ) {
     SectionCard(title = stringResource(R.string.settings_tab_graphics)) {
-        if (gameDbRecommendation != null) {
-            Text(
-                text = if (gameDbRecommendation.backendRenderer != null && gameDbRecommendation.memoryMapping != null) {
-                    stringResource(R.string.game_manager_db_recommendation,
-                        gameDbRecommendation.backendRenderer, gameDbRecommendation.memoryMapping)
-                } else {
-                    stringResource(R.string.settings_core_high_accuracy)
-                },
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.primary
-            )
-        }
         ChoiceRow(stringResource(R.string.settings_core_renderer_label), stringResource(R.string.settings_help_renderer), config.backendRenderer, listOf("Vulkan", "OpenGL"), { onUpdate { it.copy(backendRenderer = defaults.backendRenderer) } }) {
             onUpdate { cfg -> cfg.copy(backendRenderer = it) }
         }
@@ -540,7 +525,6 @@ private fun GraphicsProfileSection(
         ChoiceRow(stringResource(R.string.settings_memory_mapping), stringResource(R.string.settings_help_memory_mapping), config.memoryMapping, listOf("disabled", "double-buffer", "external-host", "page-table", "native-buffer"), { onUpdate { it.copy(memoryMapping = defaults.memoryMapping) } }) {
             onUpdate { cfg -> cfg.copy(memoryMapping = it) }
         }
-        ToggleRow(stringResource(R.string.settings_core_high_accuracy), config.highAccuracy, stringResource(R.string.settings_help_high_accuracy), { onUpdate { it.copy(highAccuracy = defaults.highAccuracy) } }) { onUpdate { cfg -> cfg.copy(highAccuracy = it) } }
         ToggleRow(stringResource(R.string.settings_core_vsync), config.vSync, stringResource(R.string.settings_help_vsync), { onUpdate { it.copy(vSync = defaults.vSync) } }) { onUpdate { cfg -> cfg.copy(vSync = it) } }
         ToggleRow(stringResource(R.string.settings_core_stretch_display), config.stretchDisplayArea, stringResource(R.string.settings_help_stretch_display), { onUpdate { it.copy(stretchDisplayArea = defaults.stretchDisplayArea) } }) { onUpdate { cfg -> cfg.copy(stretchDisplayArea = it) } }
         ToggleRow(stringResource(R.string.settings_core_fps_hack), config.fpsHack, stringResource(R.string.settings_help_fps_hack), { onUpdate { it.copy(fpsHack = defaults.fpsHack) } }) { onUpdate { cfg -> cfg.copy(fpsHack = it) } }

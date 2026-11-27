@@ -31,6 +31,7 @@
 #include <windows.h>
 #endif
 #include <display/functions.h>
+#include <util/frame_pacing.h>
 
 #include <cheat/functions.h>
 #include <config/state.h>
@@ -63,6 +64,42 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
         emuenv.kernel.invalidate_jit_cache(address, size);
     };
 
+    // Hang-watchdog bookkeeping. It belongs to this vblank thread, which lives exactly
+    // one session (start_sync_thread / DisplayState::deinit), so every session starts
+    // it fresh instead of inheriting the previous session's stall state (B151).
+    struct HangWatchdog {
+        uint64_t next_forced_dump_vblank = 0;
+        uint64_t last_dumped_setframe = ~0ull;
+        uint64_t last_break_vblanks = 0;
+        uint64_t last_provable_break_setframe = ~0ull;
+        uint64_t last_progress_value = 0;
+        uint64_t last_progress_change_vblank = 0;
+        std::vector<SceUID> nudged_this_stall;
+        uint64_t last_wake_value = 0;
+        uint64_t last_wake_change_vblank = 0;
+        bool never_flip_redumped = false;
+        uint64_t last_seen_vblanks = 0;
+    } watchdog;
+
+    frame_pacing::VblankFollower follower;
+    bool vsync_stalled = false;
+#ifndef NDEBUG
+    frame_pacing::IntervalHistogram vblank_histogram;
+    auto last_vblank = std::chrono::steady_clock::time_point{};
+    auto histogram_start = std::chrono::steady_clock::now();
+    const auto pacing_trace_vblank = [&]() {
+        // debug builds only: guest vblank interval histogram, logged every 5 s (ECVPACE)
+        const auto now = std::chrono::steady_clock::now();
+        if (last_vblank != std::chrono::steady_clock::time_point{})
+            vblank_histogram.add(std::chrono::duration<double, std::milli>(now - last_vblank).count());
+        last_vblank = now;
+        if (now - histogram_start >= std::chrono::seconds(5)) {
+            LOG_INFO("ECVPACE vblank {}", vblank_histogram.format());
+            vblank_histogram.clear();
+            histogram_start = now;
+        }
+    };
+#endif
     while (!display.abort.load()) {
         struct ProducerIteration {
             DisplayState &display;
@@ -111,7 +148,7 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
 #ifndef NDEBUG
         // Periodic thread dump for diagnosing partial hangs
         if (emuenv.cfg.hang_dump_seconds > 0) {
-            static uint64_t next_forced_dump_vblank = 0;
+            uint64_t &next_forced_dump_vblank = watchdog.next_forced_dump_vblank;
             const uint64_t vblanks_now = emuenv.display.vblank_count.load();
             const uint64_t period = static_cast<uint64_t>(emuenv.cfg.hang_dump_seconds) * 60;
             if (period > 0 && vblanks_now >= next_forced_dump_vblank && !emuenv.kernel.is_threads_paused()) {
@@ -124,39 +161,23 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
 #endif
         // Hang watchdog - if there's no framebuffer flip for ~10s (600 vblanks) while unpaused then dump guest threads
         {
-#ifndef NDEBUG
-            static uint64_t last_dumped_setframe = ~0ull;
-#endif
-            static uint64_t last_break_vblanks = 0;
-            static uint64_t last_provable_break_setframe = ~0ull;
-            static uint64_t last_progress_value = 0;
-            static uint64_t last_progress_change_vblank = 0;
-            static std::vector<SceUID> nudged_this_stall;
-            static uint64_t last_wake_value = 0;
-            static uint64_t last_wake_change_vblank = 0;
-#ifndef NDEBUG
-            static bool never_flip_redumped = false;
-#endif
-            static uint64_t last_seen_vblanks = 0;
             const uint64_t setframe = emuenv.display.last_setframe_vblank_count.load();
             const uint64_t vblanks = emuenv.display.vblank_count.load();
-            // vblank_count restarts at 0 each game session (DisplayState::deinit); these statics outlive it, so reset them with it
-            if (vblanks < last_seen_vblanks) {
+            // A save-state load rewinds vblank_count within the session: start the bookkeeping over with it
+            if (vblanks < watchdog.last_seen_vblanks)
+                watchdog = HangWatchdog{};
+            watchdog.last_seen_vblanks = vblanks;
 #ifndef NDEBUG
-                last_dumped_setframe = ~0ull;
+            uint64_t &last_dumped_setframe = watchdog.last_dumped_setframe;
+            bool &never_flip_redumped = watchdog.never_flip_redumped;
 #endif
-                last_break_vblanks = 0;
-                last_provable_break_setframe = ~0ull;
-                last_progress_value = 0;
-                last_progress_change_vblank = 0;
-                last_wake_value = 0;
-                last_wake_change_vblank = 0;
-                nudged_this_stall.clear();
-#ifndef NDEBUG
-                never_flip_redumped = false;
-#endif
-            }
-            last_seen_vblanks = vblanks;
+            uint64_t &last_break_vblanks = watchdog.last_break_vblanks;
+            uint64_t &last_provable_break_setframe = watchdog.last_provable_break_setframe;
+            uint64_t &last_progress_value = watchdog.last_progress_value;
+            uint64_t &last_progress_change_vblank = watchdog.last_progress_change_vblank;
+            std::vector<SceUID> &nudged_this_stall = watchdog.nudged_this_stall;
+            uint64_t &last_wake_value = watchdog.last_wake_value;
+            uint64_t &last_wake_change_vblank = watchdog.last_wake_change_vblank;
             const bool unpaused = !emuenv.kernel.is_threads_paused();
             const bool never_flipped = (setframe == 0);
             const uint64_t stall_vblanks = (vblanks > setframe) ? (vblanks - setframe) : 0;
@@ -244,15 +265,63 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
             }
         }
 
+#ifndef NDEBUG
+        pacing_trace_vblank();
+#endif
         const auto time_ms = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         const int64_t interval = 1000000LL / display.refresh_hz;
         const auto time_left = interval - (time_ms % interval);
+
+        // Guest vblank follows the panel: the next tick is the panel vsync on which the 60 Hz accumulator
+        // overflows, so a flip made after a tick is always presented on the same refresh cadence.
+        if (display.panel_vsync && display.follow_panel_vsync && emuenv.cfg.current_config.v_sync) {
+            // The timer drives the guest (exactly as before) while the refresh rate is still being
+            // measured and while the source delivers nothing (app hidden, compositor stalled).
+            constexpr auto vsync_silence = std::chrono::milliseconds(50);
+            bool timer_mode = vsync_stalled || !follower.locked();
+            auto deadline = std::chrono::steady_clock::now() + (timer_mode ? std::chrono::microseconds(time_left) : std::chrono::duration_cast<std::chrono::microseconds>(vsync_silence));
+            bool tick_due = false;
+            while (!display.abort.load()) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline)
+                    break;
+                int64_t timestamp_ns = 0;
+                if (!display.panel_vsync->wait_next(std::chrono::duration_cast<std::chrono::microseconds>(deadline - now), timestamp_ns))
+                    break;
+                if (vsync_stalled) {
+                    vsync_stalled = false;
+                    follower.resync();
+                }
+                // Several vblanks due at once (missed vsyncs) are not replayed, the timer never did either.
+                const bool due = follower.on_vsync(timestamp_ns) > 0;
+                if (timer_mode) {
+                    if (!follower.locked())
+                        continue;
+                    timer_mode = false;
+                    deadline = std::chrono::steady_clock::now() + vsync_silence;
+                } else {
+                    deadline = std::chrono::steady_clock::now() + vsync_silence;
+                }
+                if (due) {
+                    tick_due = true;
+                    break;
+                }
+            }
+            if (!tick_due && !timer_mode && !display.abort.load()) {
+                // no vsync for 50 ms: fall back to the timer until they return
+                vsync_stalled = true;
+                follower.resync();
+            }
+            continue;
+        }
         std::this_thread::sleep_for(std::chrono::microseconds(time_left));
     }
 }
 
 void start_sync_thread(EmuEnvState &emuenv) {
     register_display_wait_continuations(emuenv.display, emuenv.kernel);
+    if (emuenv.display.follow_panel_vsync && !emuenv.display.panel_vsync)
+        emuenv.display.panel_vsync = create_panel_vsync_source();
     emuenv.display.vblank_thread = std::make_unique<std::thread>(vblank_sync_thread, std::ref(emuenv));
 }
 
@@ -473,6 +542,7 @@ void DisplayState::deinit() {
         vblank_thread->join();
 
     vblank_thread.reset();
+    panel_vsync.reset();
     abort = false;
 
     {
@@ -498,6 +568,7 @@ void DisplayState::deinit() {
     fps_hack = false;
     shell_suspended = false;
     refresh_hz = 60;
+    follow_panel_vsync = false;
     // pretty sure we set this on game boot
     fullscreen = false;
 }

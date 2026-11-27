@@ -714,7 +714,8 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
             .independentBlend = physical_device_features.independentBlend,
             // per-sample framebuffer fetch of multisampled scenes (B140)
             .sampleRateShading = physical_device_features.sampleRateShading,
-            .depthClamp = enable_depth_clamp ? physical_device_features.depthClamp : VK_FALSE,
+            // depth range tiers ClampClipDistance / FragmentDiscard (gpu_caps.h DepthRangePath)
+            .depthClamp = physical_device_features.depthClamp,
             // P1: features the code relies on (BCn/ASTC/ETC2 texture formats, depth bias clamp) are enabled whenever the driver has them;
             // formats are still gated per-format by vkGetPhysicalDeviceFormatProperties
             .depthBiasClamp = physical_device_features.depthBiasClamp,
@@ -1023,8 +1024,11 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
 
         features.preserve_f16_nan_as_u16 = static_cast<bool>(physical_device_features.independentBlend);
 
-        // depth clamp turns off z-clipping, so behind-the-eye primitives must be clipped in the shader instead
-        features.support_clip_distance = enable_depth_clamp && static_cast<bool>(physical_device_features.depthClamp) && static_cast<bool>(physical_device_features.shaderClipDistance);
+        // the Vita depth range rule (gpu_caps.h DepthRangePath): with depth clamp the pipeline clamps depth and the shader clips
+        // behind the eye and at the far plane (clip distances, else a fragment discard); without depth clamp the vertex shader
+        // clamps depth and the rasteriser clips
+        features.support_clip_distance = gpu_strategy.depth_range == DepthRangePath::ClampClipDistance;
+        features.fragment_depth_clip = gpu_strategy.depth_range == DepthRangePath::FragmentDiscard;
 
         // a vertex program's own clip planes are unrelated to the depth clamp so they only need the device feature
         features.support_gxm_clip_planes = static_cast<bool>(physical_device_features.shaderClipDistance);
@@ -1132,6 +1136,12 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
     // Get Queues
     general_queue = device.getQueue(general_family_index, 0);
     transfer_queue = device.getQueue(transfer_family_index, 0);
+    // A second queue of the general family (all of the family's queues were created, and every queue of a
+    // family presents to the same surfaces) lets presentation run on its own thread.
+    present_queue = general_queue;
+    if (general_family_index < physical_device_queue_families.size()
+        && physical_device_queue_families[general_family_index].queueCount > 1)
+        present_queue = device.getQueue(general_family_index, 1);
 
     // Create Command Pools
     {
@@ -1347,10 +1357,8 @@ void VKState::late_init(const Config &cfg, const std::string_view game_id, MemSt
     ecv::oracle::gpu::g_oracle_mem = &mem;
 #endif
 
-    bool use_high_accuracy = cfg.current_config.high_accuracy;
     surface_sync_clamp_rt = cfg.surface_sync_clamp_rt;
     eager_surface_sync = cfg.current_config.eager_surface_sync;
-    depth_clamp_enabled = cfg.current_config.depth_clamp;
 
     constexpr bool force_direct_fragcolor_variant = false;
     if (force_direct_fragcolor_variant && features.support_shader_interlock) {
@@ -1358,8 +1366,8 @@ void VKState::late_init(const Config &cfg, const std::string_view game_id, MemSt
         features.support_shader_interlock = false;
     }
 
-    // shader interlock is more accurate but slower
-    if (features.support_shader_interlock && use_high_accuracy) {
+    // shader interlock when the device has it (the accurate framebuffer fetch), the subpass input otherwise
+    if (features.support_shader_interlock) {
         LOG_INFO("Using shader interlock for accurate framebuffer fetch emulation");
     } else {
         // We use subpass input to get something similar to direct fragcolor access (there is no difference for the shader)
@@ -1380,12 +1388,6 @@ void VKState::late_init(const Config &cfg, const std::string_view game_id, MemSt
 
     // B140: multisampling is usable when the strategy's resolve path, sample rate shading and the subpass-input fetch are all there
     msaa::init(*this);
-
-    // texture viewport is faster but not entirely accurate
-    if (support_standard_layout && !use_high_accuracy) {
-        LOG_INFO("The Vulkan renderer is using texture viewport for better performance");
-        features.use_texture_viewport = true;
-    }
 
     // parse the mapping method
     auto &config_mapping = cfg.current_config.memory_mapping;
@@ -1507,19 +1509,19 @@ void VKState::log_gpu_configuration(const Config &cfg) {
     LOG_INFO("  FeatureState: use_mask_bit={} support_unknown_format={} support_rgb_attributes={} support_scaled_attribute_formats={}",
         features.use_mask_bit, features.support_unknown_format, features.support_rgb_attributes,
         features.support_scaled_attribute_formats);
-    LOG_INFO("  FeatureState: enable_memory_mapping={} use_texture_viewport={} spirv_shader={} features_mask=0x{:X}",
-        features.enable_memory_mapping, features.use_texture_viewport, features.spirv_shader, get_features_mask());
+    LOG_INFO("  FeatureState: enable_memory_mapping={} spirv_shader={} features_mask=0x{:X}",
+        features.enable_memory_mapping, features.spirv_shader, get_features_mask());
     LOG_INFO("  derived: should_use_shader_interlock={} should_use_texture_barrier={} programmable_blending={}",
         features.should_use_shader_interlock(), features.should_use_texture_barrier(),
         features.is_programmable_blending_supported());
-    LOG_INFO("  build switches: enable_depth_clamp={} support_clip_distance={} gxm_clip_planes={}", enable_depth_clamp, features.support_clip_distance, features.support_gxm_clip_planes);
+    LOG_INFO("  build switches: depth_range={} support_clip_distance={} fragment_depth_clip={} gxm_clip_planes={}", to_string(gpu_strategy.depth_range), features.support_clip_distance, features.fragment_depth_clip, features.support_gxm_clip_planes);
 
     const char *mapping_names[] = { "Disabled", "DoubleBuffer", "ExternalHost", "PageTable", "NativeBuffer" };
     const int mapping_idx = static_cast<int>(mapping_method);
-    LOG_INFO("  session config: mapping_method={} screen_filter={} res_multiplier={} high_accuracy={} validation_layer={}",
+    LOG_INFO("  session config: mapping_method={} screen_filter={} res_multiplier={} validation_layer={}",
         (mapping_idx >= 0 && mapping_idx <= 4) ? mapping_names[mapping_idx] : "?",
         screen_renderer.filter ? screen_renderer.filter->get_name() : "<not created yet>",
-        res_multiplier, cfg.current_config.high_accuracy, cfg.validation_layer);
+        res_multiplier, cfg.validation_layer);
     LOG_INFO("  session config: fullscreen={} stretch_display_area={} hd_res_pixel_perfect={} swapchain={}x{} is_adreno_stock={} is_adreno_turnip={}",
         fullscreen, stretch_the_display_area, fullscreen_hd_res_pixel_perfect,
         screen_renderer.extent.width, screen_renderer.extent.height, is_adreno_stock, is_adreno_turnip);
@@ -1589,7 +1591,7 @@ void VKState::cleanup() {
     };
 
     try {
-        device.waitIdle();
+        wait_device_idle();
     } catch (const vk::DeviceLostError &) {
         log_device_fault();
         throw;
@@ -1891,7 +1893,7 @@ void VKState::swap_window() {
     // Android asked us to give memory back!
     const int trim_level = mem_diag::pending_trim_level.exchange(-1, std::memory_order_relaxed);
     if (trim_level >= 0) {
-        device.waitIdle();
+        wait_device_idle();
         const uint64_t freed = texture_cache.release_all_cached_textures();
         LOG_WARN("[ANDROID MEMORY] trim level {}: released {} MiB of cached textures", trim_level, freed / (1024 * 1024));
         logging::flush();
@@ -1930,7 +1932,6 @@ uint32_t VKState::get_features_mask() {
     union {
         struct {
             bool use_shader_interlock : 1;
-            bool use_texture_viewport : 1;
             bool use_memory_mapping : 1;
             bool use_rgb_attributes : 1;
             bool use_scaled_attributes : 1;
@@ -1941,6 +1942,7 @@ uint32_t VKState::get_features_mask() {
             bool support_unknown_format : 1;
             bool use_clip_distance : 1;
             bool use_gxm_clip_planes : 1;
+            bool fragment_depth_clip : 1;
             bool force_full_precision : 1;
             bool no_fp_contraction : 1;
             bool support_vertex_stores : 1;
@@ -1952,7 +1954,6 @@ uint32_t VKState::get_features_mask() {
 
     features_mask.value = 0;
     features_mask.use_shader_interlock = features.support_shader_interlock;
-    features_mask.use_texture_viewport = features.use_texture_viewport;
     features_mask.use_memory_mapping = features.enable_memory_mapping;
     features_mask.use_rgb_attributes = features.support_rgb_attributes;
     features_mask.use_scaled_attributes = pipeline_cache.support_scaled_vertex_attribute;
@@ -1963,6 +1964,7 @@ uint32_t VKState::get_features_mask() {
     features_mask.support_unknown_format = features.support_unknown_format;
     features_mask.use_clip_distance = features.support_clip_distance;
     features_mask.use_gxm_clip_planes = features.support_gxm_clip_planes;
+    features_mask.fragment_depth_clip = features.fragment_depth_clip;
     features_mask.force_full_precision = features.force_full_precision;
     features_mask.no_fp_contraction = features.no_fp_contraction;
     features_mask.support_vertex_stores = features.support_vertex_stores;
@@ -2383,7 +2385,7 @@ bool VKState::reset_frame_runtime_for_restore(std::string &error) {
         return false;
     }
     try {
-        device.waitIdle();
+        wait_device_idle();
         reset_frame_runtime_after_idle(frames,
             [](FrameObject &frame) { frame.destroy_queue.destroy_objects(); },
             [&](FrameObject &frame) {
@@ -2405,8 +2407,13 @@ void VKState::flush_surfaces(MemState &mem) {
     surface_cache.flush_all_surfaces(mem);
 }
 
-void VKState::wait_gpu_idle() {
+void VKState::wait_device_idle() {
+    const std::lock_guard<std::mutex> lock(present_queue_mutex);
     device.waitIdle();
+}
+
+void VKState::wait_gpu_idle() {
+    wait_device_idle();
     // Cold launches have no GXM context/request reader yet. GPU completion
     // remains necessary, but no host writeback marker can run in that state.
     if (!features.enable_memory_mapping || !context
@@ -2437,7 +2444,7 @@ void VKState::unmap_memory(MemState &mem, Ptr<void> address) {
 
     // we need to wait in case the buffer is being used
     try {
-        device.waitIdle();
+        wait_device_idle();
     } catch (const vk::DeviceLostError &) {
         log_device_fault();
         throw;

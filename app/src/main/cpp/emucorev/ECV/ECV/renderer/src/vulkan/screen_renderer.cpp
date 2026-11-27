@@ -15,6 +15,7 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+#include <util/frame_pacing.h>
 #include "renderer/vulkan/screen_renderer.h"
 #include "renderer/vulkan/surface_capability_selection.h"
 
@@ -24,7 +25,12 @@
 #include "emucorev/shaders/vulkan_shader_chain.h"
 #include "emucorev/shaders/shader_preset_bridge.h"
 
+#include <array>
 #include <cstdint>
+#include <cstring>
+#ifdef __ANDROID__
+#include <pthread.h>
+#endif
 #include <cmath>
 #include <exception>
 
@@ -49,11 +55,21 @@
 #include <SDL3/SDL_vulkan.h>
 #include <jni.h>
 
-static std::atomic<bool> has_surface{ false };
+// Number of live EmuSurface surfaces. A process hosts one Emulator activity at a
+// time, but when a game is closed and the next one opened the old activity's
+// surfaceDestroyed can arrive after the new one's surfaceCreated; a single bool
+// then said "no surface" for the whole next session and it never presented (B151).
+static std::atomic<int> live_surfaces{ 0 };
 
 extern "C" JNIEXPORT void JNICALL
 ECV_NativeBridge_EmuSurface_setSurfaceStatus(JNIEnv *, jobject, jboolean surface_present) {
-    has_surface.store(surface_present, std::memory_order_release);
+    if (surface_present) {
+        live_surfaces.fetch_add(1, std::memory_order_acq_rel);
+        return;
+    }
+    int current = live_surfaces.load(std::memory_order_acquire);
+    while (current > 0 && !live_surfaces.compare_exchange_weak(current, current - 1, std::memory_order_acq_rel)) {
+    }
 }
 #endif
 
@@ -70,7 +86,7 @@ bool window_has_drawable_size(const VKState &state) {
 
 #ifdef __ANDROID__
 bool has_android_surface() {
-    return has_surface.load(std::memory_order_acquire);
+    return live_surfaces.load(std::memory_order_acquire) > 0;
 }
 #endif
 
@@ -228,28 +244,9 @@ bool ScreenRenderer::setup() {
         }
     }
 
-    // preferred order : mailbox > fifo_relaxed > fifo > whatever
-    // the only drawback for mailbox is that it draws more power, so maybe on a portable device use something else
-    // this one should always be available
-    present_mode = vk::PresentModeKHR::eImmediate;
-    const auto present_modes = state.physical_device.getSurfacePresentModesKHR(surface);
-    for (const auto &mode : present_modes) {
-        if (mode == vk::PresentModeKHR::eMailbox) {
-            present_mode = mode;
-            break;
-        }
-
-        if (mode == vk::PresentModeKHR::eFifoRelaxed) {
-            present_mode = mode;
-        }
-        if (present_mode == vk::PresentModeKHR::eFifoRelaxed)
-            continue;
-
-        if (mode == vk::PresentModeKHR::eFifo) {
-            present_mode = mode;
-        }
-    }
-    LOG_INFO("Present mode: {}", vk::to_string(present_mode));
+    // the swapchain below picks its present mode from the configured v-sync
+    if (const int initial_vsync = state.pending_vsync.exchange(-1, std::memory_order_relaxed); initial_vsync >= 0)
+        vsync_enabled = initial_vsync != 0;
 
     create_render_pass();
 
@@ -263,10 +260,37 @@ bool ScreenRenderer::setup() {
     filter->init();
     emucorev::shaders::registerScreenRenderer(this);
 
+    start_present_thread();
     return true;
 }
 
+void ScreenRenderer::select_present_mode() {
+    // v-sync on (the default): FIFO, one image per panel refresh, never drops or tears, which is what
+    // an even frame cadence needs. v-sync off: the best mode that does not tear (mailbox), then the rest.
+    frame_pacing::PresentModeSupport support;
+    for (const auto &mode : state.physical_device.getSurfacePresentModesKHR(surface)) {
+        support.mailbox |= mode == vk::PresentModeKHR::eMailbox;
+        support.immediate |= mode == vk::PresentModeKHR::eImmediate;
+        support.fifo_relaxed |= mode == vk::PresentModeKHR::eFifoRelaxed;
+    }
+    const vk::PresentModeKHR previous = present_mode;
+#ifdef __ANDROID__
+    constexpr bool allow_immediate = false; // IMMEDIATE exhausts the BufferQueue on Android
+#else
+    constexpr bool allow_immediate = true;
+#endif
+    switch (frame_pacing::choose_present_mode(vsync_enabled, support, allow_immediate)) {
+    case frame_pacing::PresentMode::Mailbox: present_mode = vk::PresentModeKHR::eMailbox; break;
+    case frame_pacing::PresentMode::Immediate: present_mode = vk::PresentModeKHR::eImmediate; break;
+    case frame_pacing::PresentMode::FifoRelaxed: present_mode = vk::PresentModeKHR::eFifoRelaxed; break;
+    case frame_pacing::PresentMode::Fifo: present_mode = vk::PresentModeKHR::eFifo; break;
+    }
+    if (present_mode != previous)
+        LOG_INFO("Present mode: {} (v-sync {})", vk::to_string(present_mode), vsync_enabled ? "on" : "off");
+}
+
 bool ScreenRenderer::create_swapchain() {
+    select_present_mode();
     surface_capabilities = state.physical_device.getSurfaceCapabilitiesKHR(surface);
     SwapchainCapabilitiesSelection capabilities_selection;
     if (!select_swapchain_capabilities(surface_capabilities, !state.is_adreno_turnip, capabilities_selection)) {
@@ -285,6 +309,29 @@ bool ScreenRenderer::create_swapchain() {
     if (extent.width == 0 || extent.height == 0)
         return false;
 
+    // Pre-rotation: the surface reports its current extent in the window's orientation and the rotation
+    // between that and the panel as currentTransform.
+    created_surface_transform = surface_capabilities.currentTransform;
+    {
+        frame_pacing::PreRotation current = frame_pacing::PreRotation::None;
+        switch (surface_capabilities.currentTransform) {
+        case vk::SurfaceTransformFlagBitsKHR::eRotate90: current = frame_pacing::PreRotation::Rotate90; break;
+        case vk::SurfaceTransformFlagBitsKHR::eRotate180: current = frame_pacing::PreRotation::Rotate180; break;
+        case vk::SurfaceTransformFlagBitsKHR::eRotate270: current = frame_pacing::PreRotation::Rotate270; break;
+        default: break;
+        }
+        const auto &caps = surface_capabilities;
+        pre_rotation = frame_pacing::choose_pre_rotation(current,
+            static_cast<bool>(caps.supportedTransforms & caps.currentTransform), { extent.width, extent.height },
+            { caps.minImageExtent.width, caps.minImageExtent.height }, { caps.maxImageExtent.width, caps.maxImageExtent.height });
+        if (pre_rotation != frame_pacing::PreRotation::None && !create_pre_rotation_pipeline())
+            pre_rotation = frame_pacing::PreRotation::None;
+        const frame_pacing::Extent presented = frame_pacing::pre_rotated_extent(pre_rotation, { extent.width, extent.height });
+        swapchain_extent = vk::Extent2D{ presented.width, presented.height };
+        if (current != frame_pacing::PreRotation::None && pre_rotation == frame_pacing::PreRotation::None)
+            LOG_WARN("Present: surface rotation {} left to the presentation engine", vk::to_string(caps.currentTransform));
+    }
+
     swapchain_size = surface_capabilities.minImageCount + 1;
     if (surface_capabilities.maxImageCount != 0)
         swapchain_size = std::min(swapchain_size, surface_capabilities.maxImageCount);
@@ -295,22 +342,26 @@ bool ScreenRenderer::create_swapchain() {
         support_swapchain_transfer_dst = capabilities_selection.transfer_dst;
         swapchain_has_storage = capabilities_selection.storage;
 
-        LOG_INFO("swapchain: format={} colorspace={} extent={}x{} supportedUsage=0x{:X} chosenUsage=0x{:X} images={} currentTransform={} usedTransform={}",
+        const vk::SurfaceTransformFlagBitsKHR pre_transform = pre_rotation != frame_pacing::PreRotation::None
+            ? surface_capabilities.currentTransform
+            : capabilities_selection.pre_transform;
+        LOG_WARN("swapchain: format={} colorspace={} extent={}x{} image={}x{} supportedUsage=0x{:X} chosenUsage=0x{:X} images={} currentTransform={} usedTransform={}",
             vk::to_string(surface_format.format), vk::to_string(surface_format.colorSpace), extent.width, extent.height,
+            swapchain_extent.width, swapchain_extent.height,
             static_cast<uint32_t>(surface_capabilities.supportedUsageFlags), static_cast<uint32_t>(surface_usage),
             swapchain_size, vk::to_string(surface_capabilities.currentTransform),
-            vk::to_string(capabilities_selection.pre_transform));
+            vk::to_string(pre_transform));
 
         vk::SwapchainCreateInfoKHR swapchain_info{
             .surface = surface,
             .minImageCount = swapchain_size,
             .imageFormat = surface_format.format,
             .imageColorSpace = surface_format.colorSpace,
-            .imageExtent = extent,
+            .imageExtent = swapchain_extent,
             .imageArrayLayers = 1,
             .imageUsage = surface_usage,
             .imageSharingMode = vk::SharingMode::eExclusive,
-            .preTransform = capabilities_selection.pre_transform,
+            .preTransform = pre_transform,
             .compositeAlpha = capabilities_selection.composite_alpha,
             .presentMode = present_mode,
             .clipped = true,
@@ -322,6 +373,12 @@ bool ScreenRenderer::create_swapchain() {
     // Get Swapchain Images
     swapchain_images = state.device.getSwapchainImagesKHR(swapchain);
     swapchain_size = swapchain_images.size();
+    if (pre_rotation != frame_pacing::PreRotation::None) {
+        // the screen passes render into window-orientation images; the swapchain images are only presented
+        present_images = std::move(swapchain_images);
+        if (!create_pre_rotation_targets(capabilities_selection.image_usage))
+            return false;
+    }
 
     // Get Image views
     swapchain_views.resize(swapchain_size);
@@ -373,6 +430,7 @@ void ScreenRenderer::destroy_swapchain() {
     for (vk::ImageView view : swapchain_views)
         state.device.destroy(view);
     swapchain_views.clear();
+    destroy_pre_rotation_targets();
 
     if (swapchain) {
         state.device.destroySwapchainKHR(swapchain);
@@ -382,7 +440,8 @@ void ScreenRenderer::destroy_swapchain() {
 
 void ScreenRenderer::cleanup() {
     emucorev::shaders::unregisterScreenRenderer(this);
-    state.device.waitIdle();
+    stop_present_thread();
+    state.wait_device_idle();
 
     shader_chain.destroy();
     filter.reset();
@@ -413,6 +472,8 @@ void ScreenRenderer::cleanup() {
     for (vk::ImageView view : swapchain_views)
         state.device.destroy(view);
     swapchain_views.clear();
+    destroy_pre_rotation_targets();
+    destroy_pre_rotation_pipeline();
 
     state.device.destroy(swapchain);
     swapchain = nullptr;
@@ -459,6 +520,15 @@ bool ScreenRenderer::acquire_swapchain_image() {
 
     vk::Result acquire_result = vk::Result::eErrorOutOfDateKHR;
 
+    // vkAcquireNextImageKHR and vkQueuePresentKHR both need the swapchain externally synchronised, and
+    // with minImageCount + 1 images the next image may only become available once the previous one is
+    // presented: the previous present finishes first. The present thread overlaps it with everything
+    // the render thread does between swap_window() and this acquire (the next guest frame).
+    drain_present();
+    // outcome of the last present made by the present thread
+    if (const int async_result = present_async_result.exchange(0, std::memory_order_acquire); async_result != 0)
+        handle_present_result(static_cast<vk::Result>(async_result));
+
     current_frame++;
     if (current_frame == swapchain_size + 1)
         current_frame = 0;
@@ -498,7 +568,10 @@ bool ScreenRenderer::acquire_swapchain_image() {
         return false;
     }
 
-    if (acquire_result == vk::Result::eSuboptimalKHR && note_size_mismatch(!surface_matches_window_size())) {
+    if (acquire_result == vk::Result::eSuboptimalKHR && surface_transform_changed()) {
+        need_rebuild = true;
+        rebuild_reason = "suboptimal: surface rotation changed";
+    } else if (acquire_result == vk::Result::eSuboptimalKHR && note_size_mismatch(!surface_matches_window_size())) {
         need_rebuild = true;
         rebuild_reason = "suboptimal + persistent size mismatch";
     }
@@ -563,7 +636,7 @@ void ScreenRenderer::render(vk::ImageView image_view, vk::ImageLayout layout, co
         static_cast<VkDevice>(state.device),
         static_cast<VkQueue>(state.general_queue),
         VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
-        VULKAN_HPP_DEFAULT_DISPATCHER.vkDeviceWaitIdle,
+        [this] { state.wait_device_idle(); },
         shader_error);
     if (!shader_error.empty())
         LOG_ERROR("RetroArch shader preset could not be loaded: {}", shader_error);
@@ -717,8 +790,11 @@ bool ScreenRenderer::swap_window() {
         return false;
     }
 
-    // first submit the command buffer
+    // first submit the command buffer. The submit always happens, even when the present below is dropped
+    // (rebuild pending, failed present): the frame's GPU work and its fence never depend on the present.
     current_cmd_buffer.endRenderPass();
+    if (pre_rotation != frame_pacing::PreRotation::None)
+        record_pre_rotation();
     current_cmd_buffer.end();
     vk::SubmitInfo submit_info{};
     std::array<vk::Semaphore, 1> wait_semaphores = { image_acquired_semaphores[current_frame] };
@@ -730,18 +806,40 @@ bool ScreenRenderer::swap_window() {
     submit_info.setCommandBuffers(current_cmd_buffer);
     state.general_queue.submit(submit_info, fences[swapchain_image_idx]);
 
-    // then present the surface
+    const PresentRequest request{ swapchain, swapchain_image_idx, image_ready_semaphores[swapchain_image_idx] };
+    swapchain_image_idx = ~0;
+    current_cmd_buffer = nullptr;
+
+    if (present_thread.joinable()) {
+        // hand the present to the present thread; its outcome is applied on the next acquire
+        std::unique_lock<std::mutex> lock(present_mutex);
+        present_cv.wait(lock, [this] { return !present_pending.has_value(); });
+        present_pending = request;
+        lock.unlock();
+        present_cv.notify_all();
+        return true;
+    }
+    return handle_present_result(present_now(request));
+}
+
+vk::Result ScreenRenderer::present_now(const PresentRequest &request) {
     vk::PresentInfoKHR present_info{
         .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &image_ready_semaphores[swapchain_image_idx],
+        .pWaitSemaphores = &request.wait_semaphore,
         .swapchainCount = 1,
-        .pSwapchains = &swapchain,
-        .pImageIndices = &swapchain_image_idx,
+        .pSwapchains = &request.swapchain,
+        .pImageIndices = &request.image_index,
     };
+    const std::lock_guard<std::mutex> lock(state.present_queue_mutex);
+    return state.present_queue.presentKHR(&present_info);
+}
 
-    auto result = state.general_queue.presentKHR(&present_info);
+bool ScreenRenderer::handle_present_result(vk::Result result) {
     if (result == vk::Result::eSuboptimalKHR) {
-        if (note_size_mismatch(!surface_matches_window_size())) {
+        if (surface_transform_changed()) {
+            need_rebuild = true;
+            rebuild_reason = "present: surface rotation changed";
+        } else if (note_size_mismatch(!surface_matches_window_size())) {
             need_rebuild = true;
             rebuild_reason = "present: suboptimal + persistent size mismatch";
         }
@@ -751,14 +849,67 @@ bool ScreenRenderer::swap_window() {
         need_surface_recreate = result == vk::Result::eErrorSurfaceLostKHR;
     } else if (result != vk::Result::eSuccess) {
         LOG_ERROR("Could not present KHR.");
-        swapchain_image_idx = ~0;
-        current_cmd_buffer = nullptr;
         return false;
     }
-
-    swapchain_image_idx = ~0;
-    current_cmd_buffer = nullptr;
     return result == vk::Result::eSuccess || result == vk::Result::eSuboptimalKHR;
+}
+
+void ScreenRenderer::start_present_thread() {
+    // Capability driven: a second queue of the general family exists. With a single queue every submit and
+    // present would have to be serialised against the render thread, which buys nothing.
+    if (present_thread.joinable())
+        return;
+    if (state.present_queue == state.general_queue) {
+        LOG_WARN("Present: on the render thread (the general queue family has a single queue)");
+        return;
+    }
+    present_quit = false;
+    present_thread = std::thread([this] { present_thread_main(); });
+    LOG_WARN("Present: dedicated present thread on queue 1 of family {}", state.general_family_index);
+}
+
+void ScreenRenderer::stop_present_thread() {
+    if (!present_thread.joinable())
+        return;
+    drain_present();
+    {
+        const std::lock_guard<std::mutex> lock(present_mutex);
+        present_quit = true;
+    }
+    present_cv.notify_all();
+    present_thread.join();
+}
+
+void ScreenRenderer::drain_present() {
+    if (!present_thread.joinable())
+        return;
+    std::unique_lock<std::mutex> lock(present_mutex);
+    present_cv.wait(lock, [this] { return !present_pending.has_value() && !present_busy; });
+}
+
+void ScreenRenderer::present_thread_main() {
+#ifdef __ANDROID__
+    pthread_setname_np(pthread_self(), "ecv-present");
+#endif
+    std::unique_lock<std::mutex> lock(present_mutex);
+    for (;;) {
+        present_cv.wait(lock, [this] { return present_pending.has_value() || present_quit; });
+        if (!present_pending.has_value())
+            return;
+        const PresentRequest request = *present_pending;
+        present_pending.reset();
+        present_busy = true;
+        lock.unlock();
+        present_cv.notify_all();
+
+        const vk::Result result = present_now(request);
+        if (result != vk::Result::eSuccess)
+            present_async_result.store(static_cast<int>(result), std::memory_order_release);
+
+        lock.lock();
+        present_busy = false;
+        present_cv.notify_all();
+    }
 }
 
 void ScreenRenderer::set_filter(const std::string_view &filter) {
@@ -895,6 +1046,14 @@ bool ScreenRenderer::ensure_swapchain() {
     if (!window_has_drawable_size(state))
         return false;
 
+    // The v-sync setting can change while the game runs; the present mode is a swapchain property.
+    const int pending_vsync = state.pending_vsync.exchange(-1, std::memory_order_relaxed);
+    if (pending_vsync >= 0 && (pending_vsync != 0) != vsync_enabled) {
+        vsync_enabled = pending_vsync != 0;
+        need_rebuild = true;
+        rebuild_reason = "v-sync setting changed";
+    }
+
     if (!need_rebuild && !need_surface_recreate && swapchain) {
         // A one-frame disagreement between what Vulkan reports as the surface extent and what the window reports as its client size is not a resize
         if (!note_size_mismatch(!surface_matches_window_size()))
@@ -926,7 +1085,8 @@ bool ScreenRenderer::rebuild_swapchain_if_visible() {
 
     // This is the most expensive thing the emulator does outside loading
     // it idles the device, which stalls the vblank thread too
-    state.device.waitIdle();
+    drain_present();
+    state.wait_device_idle();
     destroy_swapchain();
 
 #ifdef __ANDROID__
@@ -950,6 +1110,305 @@ bool ScreenRenderer::surface_matches_window_size() {
 
     return extent.width == static_cast<uint32_t>(frame_host->drawable_width())
         && extent.height == static_cast<uint32_t>(frame_host->drawable_height());
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Pre-rotation
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+// the vertex layout of render_main.vert (the built-in screen quad shader)
+struct PreRotationVertex {
+    float pos[3];
+    float uv[2];
+};
+constexpr uint32_t pre_rotation_vertex_count = 4;
+} // namespace
+
+bool ScreenRenderer::create_pre_rotation_pipeline() {
+    if (pre_rotation_pipeline)
+        return true;
+    vk::Device device = state.device;
+    try {
+        // the built-in screen quad shaders: one exact texel per presented pixel (nearest, 1:1 size)
+        const fs::path builtin_shaders_path = state.static_assets / "shaders-builtin/vulkan";
+        pre_rotation_vertex_shader = vkutil::load_shader(device, builtin_shaders_path / "render_main.vert.spv");
+        pre_rotation_fragment_shader = vkutil::load_shader(device, builtin_shaders_path / "render_main.frag.spv");
+        if (!pre_rotation_vertex_shader || !pre_rotation_fragment_shader) {
+            destroy_pre_rotation_pipeline();
+            return false;
+        }
+
+        vk::SamplerCreateInfo sampler_info{
+            .magFilter = vk::Filter::eNearest,
+            .minFilter = vk::Filter::eNearest,
+            .mipmapMode = vk::SamplerMipmapMode::eNearest,
+            .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+        };
+        pre_rotation_sampler = device.createSampler(sampler_info);
+
+        vk::DescriptorSetLayoutBinding binding{
+            .binding = 0,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        };
+        vk::DescriptorSetLayoutCreateInfo set_layout_info{};
+        set_layout_info.setBindings(binding);
+        pre_rotation_set_layout = device.createDescriptorSetLayout(set_layout_info);
+
+        vk::PipelineLayoutCreateInfo layout_info{};
+        layout_info.setSetLayouts(pre_rotation_set_layout);
+        pre_rotation_pipeline_layout = device.createPipelineLayout(layout_info);
+
+        std::array<vk::PipelineShaderStageCreateInfo, 2> stages{
+            vk::PipelineShaderStageCreateInfo{ .stage = vk::ShaderStageFlagBits::eVertex, .module = pre_rotation_vertex_shader, .pName = "main" },
+            vk::PipelineShaderStageCreateInfo{ .stage = vk::ShaderStageFlagBits::eFragment, .module = pre_rotation_fragment_shader, .pName = "main" },
+        };
+        vk::VertexInputBindingDescription vertex_binding{
+            .binding = 0,
+            .stride = sizeof(PreRotationVertex),
+            .inputRate = vk::VertexInputRate::eVertex
+        };
+        std::array<vk::VertexInputAttributeDescription, 2> attributes{
+            vk::VertexInputAttributeDescription{ .location = 0, .binding = 0, .format = vk::Format::eR32G32B32Sfloat, .offset = offsetof(PreRotationVertex, pos) },
+            vk::VertexInputAttributeDescription{ .location = 1, .binding = 0, .format = vk::Format::eR32G32Sfloat, .offset = offsetof(PreRotationVertex, uv) },
+        };
+        vk::PipelineVertexInputStateCreateInfo vertex_input{};
+        vertex_input.setVertexBindingDescriptions(vertex_binding);
+        vertex_input.setVertexAttributeDescriptions(attributes);
+        vk::PipelineInputAssemblyStateCreateInfo input_assembly{ .topology = vk::PrimitiveTopology::eTriangleStrip };
+        vk::PipelineViewportStateCreateInfo viewport_state{ .viewportCount = 1, .scissorCount = 1 };
+        vk::PipelineRasterizationStateCreateInfo rasterizer{
+            .polygonMode = vk::PolygonMode::eFill,
+            .cullMode = vk::CullModeFlagBits::eNone,
+            .frontFace = vk::FrontFace::eClockwise,
+            .lineWidth = 1.0f
+        };
+        vk::PipelineMultisampleStateCreateInfo multisampling{ .rasterizationSamples = vk::SampleCountFlagBits::e1 };
+        vk::PipelineColorBlendAttachmentState blend_attachment{
+            .blendEnable = VK_FALSE,
+            .colorWriteMask = vkutil::default_color_mask
+        };
+        vk::PipelineColorBlendStateCreateInfo color_blending{};
+        color_blending.setAttachments(blend_attachment);
+        static constexpr std::array dynamic_states{ vk::DynamicState::eViewport, vk::DynamicState::eScissor };
+        vk::PipelineDynamicStateCreateInfo dynamic_info{};
+        dynamic_info.setDynamicStates(dynamic_states);
+        vk::GraphicsPipelineCreateInfo pipeline_info{
+            .pVertexInputState = &vertex_input,
+            .pInputAssemblyState = &input_assembly,
+            .pViewportState = &viewport_state,
+            .pRasterizationState = &rasterizer,
+            .pMultisampleState = &multisampling,
+            .pColorBlendState = &color_blending,
+            .pDynamicState = &dynamic_info,
+            .layout = pre_rotation_pipeline_layout,
+            .renderPass = default_render_pass,
+            .subpass = 0
+        };
+        pipeline_info.setStages(stages);
+        const auto result = device.createGraphicsPipeline(VK_NULL_HANDLE, pipeline_info);
+        if (result.result != vk::Result::eSuccess) {
+            destroy_pre_rotation_pipeline();
+            return false;
+        }
+        pre_rotation_pipeline = result.value;
+
+        pre_rotation_quad = vkutil::Buffer(sizeof(PreRotationVertex) * pre_rotation_vertex_count);
+        pre_rotation_quad.init_buffer(vk::BufferUsageFlagBits::eVertexBuffer, vkutil::vma_mapped_alloc);
+        if (!pre_rotation_quad.mapped_data) {
+            destroy_pre_rotation_pipeline();
+            return false;
+        }
+    } catch (const std::exception &exception) {
+        LOG_ERROR("Present: pre-rotation pipeline could not be created: {}", exception.what());
+        destroy_pre_rotation_pipeline();
+        return false;
+    }
+    return true;
+}
+
+void ScreenRenderer::destroy_pre_rotation_pipeline() {
+    vk::Device device = state.device;
+    pre_rotation_quad.destroy();
+    if (pre_rotation_pipeline)
+        device.destroy(pre_rotation_pipeline);
+    if (pre_rotation_pipeline_layout)
+        device.destroy(pre_rotation_pipeline_layout);
+    if (pre_rotation_set_layout)
+        device.destroy(pre_rotation_set_layout);
+    if (pre_rotation_sampler)
+        device.destroy(pre_rotation_sampler);
+    if (pre_rotation_vertex_shader)
+        device.destroy(pre_rotation_vertex_shader);
+    if (pre_rotation_fragment_shader)
+        device.destroy(pre_rotation_fragment_shader);
+    pre_rotation_pipeline = nullptr;
+    pre_rotation_pipeline_layout = nullptr;
+    pre_rotation_set_layout = nullptr;
+    pre_rotation_sampler = nullptr;
+    pre_rotation_vertex_shader = nullptr;
+    pre_rotation_fragment_shader = nullptr;
+}
+
+bool ScreenRenderer::create_pre_rotation_targets(vk::ImageUsageFlags usage) {
+    vk::Device device = state.device;
+    // The screen passes use the targets exactly as they would use swapchain images (render passes, FSR transfer and
+    // storage writes, the RetroArch chain), and the final pass samples them.
+    if (usage & vk::ImageUsageFlagBits::eStorage) {
+        const vk::FormatProperties properties = state.physical_device.getFormatProperties(surface_format.format);
+        if (!(properties.optimalTilingFeatures & vk::FormatFeatureFlagBits::eStorageImage)) {
+            usage &= ~vk::ImageUsageFlags(vk::ImageUsageFlagBits::eStorage);
+            swapchain_has_storage = false;
+        }
+    }
+    usage |= vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled;
+
+    try {
+        swapchain_images.resize(swapchain_size);
+        pre_rotation_sources.clear();
+        pre_rotation_sources.reserve(swapchain_size);
+        for (uint32_t i = 0; i < swapchain_size; i++) {
+            vkutil::Image &source = pre_rotation_sources.emplace_back(extent.width, extent.height, surface_format.format);
+            source.init_image(usage);
+            swapchain_images[i] = source.image;
+        }
+
+        present_views.resize(swapchain_size);
+        present_framebuffers.resize(swapchain_size);
+        for (uint32_t i = 0; i < swapchain_size; i++) {
+            vk::ImageViewCreateInfo view_info{
+                .image = present_images[i],
+                .viewType = vk::ImageViewType::e2D,
+                .format = surface_format.format,
+                .components = vkutil::default_comp_mapping,
+                .subresourceRange = vkutil::color_subresource_range
+            };
+            present_views[i] = device.createImageView(view_info);
+            vk::FramebufferCreateInfo fb_info{
+                .renderPass = default_render_pass,
+                .width = swapchain_extent.width,
+                .height = swapchain_extent.height,
+                .layers = 1
+            };
+            fb_info.setAttachments(present_views[i]);
+            present_framebuffers[i] = device.createFramebuffer(fb_info);
+        }
+
+        vk::DescriptorPoolSize pool_size{
+            .type = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = swapchain_size
+        };
+        vk::DescriptorPoolCreateInfo pool_info{ .maxSets = swapchain_size };
+        pool_info.setPoolSizes(pool_size);
+        pre_rotation_descriptor_pool = device.createDescriptorPool(pool_info);
+        std::vector<vk::DescriptorSetLayout> set_layouts(swapchain_size, pre_rotation_set_layout);
+        vk::DescriptorSetAllocateInfo set_info{ .descriptorPool = pre_rotation_descriptor_pool };
+        set_info.setSetLayouts(set_layouts);
+        pre_rotation_sets = device.allocateDescriptorSets(set_info);
+        for (uint32_t i = 0; i < swapchain_size; i++) {
+            vk::DescriptorImageInfo image_info{
+                .sampler = pre_rotation_sampler,
+                .imageView = pre_rotation_sources[i].view,
+                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            };
+            vk::WriteDescriptorSet write{
+                .dstSet = pre_rotation_sets[i],
+                .dstBinding = 0,
+                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            };
+            write.setImageInfo(image_info);
+            device.updateDescriptorSets(write, {});
+        }
+    } catch (const std::exception &exception) {
+        LOG_ERROR("Present: pre-rotation targets could not be created: {}", exception.what());
+        return false;
+    }
+
+    // The quad covers the whole presented image (triangle strip, Vulkan NDC: y = -1 is the top); every corner samples
+    // the window-orientation coordinate that the rotation puts there.
+    constexpr std::array<std::array<float, 2>, pre_rotation_vertex_count> corners{ {
+        { 1.f, -1.f }, { -1.f, -1.f }, { 1.f, 1.f }, { -1.f, 1.f } } };
+    std::array<PreRotationVertex, pre_rotation_vertex_count> quad{};
+    for (uint32_t i = 0; i < pre_rotation_vertex_count; i++) {
+        const float pu = (corners[i][0] + 1.f) * 0.5f;
+        const float pv = (corners[i][1] + 1.f) * 0.5f;
+        const frame_pacing::Uv uv = frame_pacing::pre_rotation_source_uv(pre_rotation, pu, pv);
+        quad[i] = PreRotationVertex{ { corners[i][0], corners[i][1], 0.f }, { uv.u, uv.v } };
+    }
+    std::memcpy(pre_rotation_quad.mapped_data, quad.data(), sizeof(quad));
+    LOG_WARN("Present: pre-rotation {} quarter turn(s), {}x{} frame into {}x{} swapchain images",
+        static_cast<int>(pre_rotation), extent.width, extent.height, swapchain_extent.width, swapchain_extent.height);
+    return true;
+}
+
+void ScreenRenderer::destroy_pre_rotation_targets() {
+    vk::Device device = state.device;
+    for (vk::Framebuffer framebuffer : present_framebuffers)
+        device.destroy(framebuffer);
+    present_framebuffers.clear();
+    for (vk::ImageView view : present_views)
+        device.destroy(view);
+    present_views.clear();
+    present_images.clear();
+    if (pre_rotation_descriptor_pool)
+        device.destroy(pre_rotation_descriptor_pool);
+    pre_rotation_descriptor_pool = nullptr;
+    pre_rotation_sets.clear();
+    // swapchain_images holds the targets' handles while they exist
+    if (!pre_rotation_sources.empty())
+        swapchain_images.clear();
+    pre_rotation_sources.clear();
+}
+
+void ScreenRenderer::record_pre_rotation() {
+    namespace sync = vkutil::sync;
+    const uint32_t index = swapchain_image_idx;
+    // every screen pass ends in the default render pass family (final layout PRESENT_SRC); FSR also writes by
+    // transfer or compute before it
+    sync::explicit_barrier(current_cmd_buffer, swapchain_images[index], vkutil::color_subresource_range,
+        { sync::S::eColorAttachmentOutput | sync::S::eComputeShader | sync::S::eTransfer, sync::S::eFragmentShader,
+            sync::A::eColorAttachmentWrite | sync::A::eShaderWrite | sync::A::eTransferWrite, sync::A::eShaderRead,
+            vk::ImageLayout::ePresentSrcKHR, vk::ImageLayout::eShaderReadOnlyOptimal, true });
+
+    vk::RenderPassBeginInfo pass_info{
+        .renderPass = default_render_pass,
+        .framebuffer = present_framebuffers[index],
+        .renderArea = { .offset = { 0, 0 }, .extent = swapchain_extent }
+    };
+    vk::ClearValue clear_color{ .color = { std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f } } };
+    pass_info.setClearValues(clear_color);
+    current_cmd_buffer.beginRenderPass(pass_info, vk::SubpassContents::eInline);
+    const vk::Viewport viewport{
+        .x = 0.0f,
+        .y = 0.0f,
+        .width = static_cast<float>(swapchain_extent.width),
+        .height = static_cast<float>(swapchain_extent.height),
+        .minDepth = 0.0f,
+        .maxDepth = 1.0f
+    };
+    current_cmd_buffer.setViewport(0, viewport);
+    current_cmd_buffer.setScissor(0, vk::Rect2D{ .offset = { 0, 0 }, .extent = swapchain_extent });
+    current_cmd_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pre_rotation_pipeline);
+    current_cmd_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pre_rotation_pipeline_layout, 0, pre_rotation_sets[index], {});
+    current_cmd_buffer.bindVertexBuffers(0, pre_rotation_quad.buffer, vk::DeviceSize{ 0 });
+    current_cmd_buffer.draw(pre_rotation_vertex_count, 1, 0, 0);
+    current_cmd_buffer.endRenderPass();
+}
+
+bool ScreenRenderer::surface_transform_changed() {
+    // without pre-rotation the presentation engine applies whatever rotation the surface has
+    if (pre_rotation == frame_pacing::PreRotation::None || !surface)
+        return false;
+    try {
+        return state.physical_device.getSurfaceCapabilitiesKHR(surface).currentTransform != created_surface_transform;
+    } catch (const std::exception &) {
+        return false;
+    }
 }
 
 } // namespace renderer::vulkan

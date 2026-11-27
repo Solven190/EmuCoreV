@@ -21,11 +21,15 @@
 
 #include "screen_filters.h"
 #include "emucorev/shaders/vulkan_shader_chain.h"
+#include <util/frame_pacing.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 
 namespace renderer::vulkan {
 
@@ -45,8 +49,14 @@ public:
     vk::SurfaceCapabilitiesKHR surface_capabilities;
     vk::SurfaceFormatKHR surface_format;
     vk::PresentModeKHR present_mode{};
+    // v-sync setting, applied to the present mode on the next swapchain (re)build
+    bool vsync_enabled = true;
+    void select_present_mode();
+    // window-orientation size every screen pass renders at
     vk::Extent2D extent;
     uint32_t swapchain_size{};
+    // The render targets of the screen passes, one per swapchain image, in the window's orientation: the
+    // swapchain images themselves, or with pre-rotation the images the final pass rotates into them.
     std::vector<vk::Image> swapchain_images;
     std::vector<vk::ImageView> swapchain_views;
     std::vector<vk::Framebuffer> swapchain_framebuffers;
@@ -107,6 +117,62 @@ public:
     std::string retroarch_shader_error() const;
 
 private:
+    struct PresentRequest {
+        vk::SwapchainKHR swapchain;
+        uint32_t image_index = 0;
+        vk::Semaphore wait_semaphore;
+    };
+
+    // Present thread: one request waits in the slot while the previous one is inside vkQueuePresentKHR, so the
+    // render thread keeps recording while a FIFO present blocks on the panel.
+    void start_present_thread();
+    void stop_present_thread();
+    // waits until no present is queued or running (before the swapchain, its semaphores or the device go away)
+    void drain_present();
+    void present_thread_main();
+    vk::Result present_now(const PresentRequest &request);
+    // applies the outcome of a present (the result of the previous asynchronous one when presenting on the thread)
+    bool handle_present_result(vk::Result result);
+
+    std::thread present_thread;
+    std::mutex present_mutex;
+    std::condition_variable present_cv;
+    std::optional<PresentRequest> present_pending;
+    bool present_busy = false;
+    bool present_quit = false;
+    // vk::Result of the last failed or suboptimal asynchronous present not yet consumed by the render thread;
+    // 0 (success) = none
+    std::atomic<int> present_async_result{ 0 };
+
+    // Pre-rotation (frame_pacing::PreRotation): the swapchain is created in the panel's orientation with the
+    // surface's current transform as preTransform and the frame, rendered in the window's orientation into
+    // pre_rotation_sources, is rotated into the presented image by one draw at the end of the frame.
+    frame_pacing::PreRotation pre_rotation = frame_pacing::PreRotation::None;
+    // the surface's current transform when the swapchain was created (a change asks for a rebuild)
+    vk::SurfaceTransformFlagBitsKHR created_surface_transform = vk::SurfaceTransformFlagBitsKHR::eIdentity;
+    // presented image size (the panel's orientation when pre-rotated)
+    vk::Extent2D swapchain_extent;
+    std::vector<vk::Image> present_images;
+    std::vector<vk::ImageView> present_views;
+    std::vector<vk::Framebuffer> present_framebuffers;
+    std::vector<vkutil::Image> pre_rotation_sources;
+    vk::ShaderModule pre_rotation_vertex_shader;
+    vk::ShaderModule pre_rotation_fragment_shader;
+    vk::Sampler pre_rotation_sampler;
+    vk::DescriptorSetLayout pre_rotation_set_layout;
+    vk::PipelineLayout pre_rotation_pipeline_layout;
+    vk::Pipeline pre_rotation_pipeline;
+    vk::DescriptorPool pre_rotation_descriptor_pool;
+    std::vector<vk::DescriptorSet> pre_rotation_sets;
+    vkutil::Buffer pre_rotation_quad;
+    bool create_pre_rotation_pipeline();
+    // the window-orientation targets for the swapchain images just created; false when they cannot be made
+    bool create_pre_rotation_targets(vk::ImageUsageFlags usage);
+    void destroy_pre_rotation_targets();
+    void destroy_pre_rotation_pipeline();
+    void record_pre_rotation();
+    bool surface_transform_changed();
+
     void create_render_pass();
     void create_layout_sync();
     bool create_swapchain();

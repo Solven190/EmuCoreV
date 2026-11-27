@@ -243,9 +243,6 @@ static Config::CurrentConfig get_runtime_current_config_after_save(
             runtime_current.custom_driver_name = previous_current.custom_driver_name;
             break;
 #endif
-        case config::RestartRequiredSetting::HighAccuracy:
-            runtime_current.high_accuracy = previous_current.high_accuracy;
-            break;
         case config::RestartRequiredSetting::ResolutionMultiplier:
             runtime_current.resolution_multiplier = previous_current.resolution_multiplier;
             break;
@@ -271,8 +268,7 @@ static Config::CurrentConfig get_runtime_current_config_after_save(
 }
 
 void set_current_config(EmuEnvState &emuenv, const std::string &app_path) {
-    const auto title = app_path == emuenv.io.app_path ? emuenv.current_app_title : std::string();
-    config::set_current_config(emuenv.cfg, emuenv.config_path, app_path, title);
+    config::set_current_config(emuenv.cfg, emuenv.config_path, app_path);
     set_backend_renderer(emuenv, emuenv.cfg.current_config.backend_renderer);
     emuenv.audio.set_global_volume(emuenv.cfg.current_config.audio_volume / 100.f);
     lang::set_locale(emuenv.cfg.current_config.sys_lang);
@@ -542,6 +538,8 @@ void shutdown_app_runtime(EmuEnvState &state) {
 
     state.audio.deinit();
 
+    if (renderer::has_pending_deferred_unmap(*state.renderer))
+        LOG_WARN("Session teardown: a deferred GPU unmap was pending; it dies with this renderer");
     state.renderer->preclose_action();
     renderer::stop_render_thread(*state.renderer);
     gxm::destroy_all_contexts(state, true);

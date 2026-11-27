@@ -151,7 +151,6 @@
     <string name="settings_frame_limit">Обмеження частоти кадрів</string>
     <string name="settings_frame_limit_unlimited">Без обмеження</string>
     <string name="settings_core_vsync">Вертикальна синхронізація</string>
-    <string name="settings_core_high_accuracy">Режим високої точності GPU</string>
     <string name="settings_core_resolution_label">Множник роздільної здатності</string>
     <string name="settings_core_resolution_value">Масштаб рендеру %1$.2fx</string>
     <string name="settings_core_overlay_opacity_label">Прозорість оверлея</string>
@@ -198,7 +197,6 @@
     <string name="settings_help_fps_hack">Знімає звичайне обмеження кадрів у деяких іграх. Це може покращити швидкість, але може порушити таймінги.\n\nВикористовуйте це для тестів, пропуску повільних місць або обходу поведінки конкретної гри. Не використовуйте постійно, якщо важливі правильний таймінг, фізика, катсцени або перевірки, схожі на онлайн-сервіси.</string>
     <string name="settings_help_frame_limit">Обмежує кількість показаних кадрів, не змінюючи таймінги емульованої Vita. 30 або 45 FPS можуть зменшити нагрівання та споживання енергії.</string>
     <string name="settings_help_vsync">Зменшує розриви екрана (tearing), але може знизити продуктивність у деяких іграх.\n\nВикористовуйте це для покращення чіткості, масштабування або візуальної стабільності в іграх, які вже працюють нормально. Зменшуйте значення або повертайте стандарт, якщо падає FPS, телефон гріється або графіка стає нестабільною.</string>
-    <string name="settings_help_high_accuracy">Може виправити графічні помилки, але зазвичай знижує продуктивність.\n\nВикористовуйте це для покращення чіткості, масштабування або візуальної стабільності в іграх, які вже працюють нормально. Зменшуйте значення або повертайте стандарт, якщо падає FPS, телефон гріється або графіка стає нестабільною.</string>
     <string name="settings_help_resolution">Більші значення роблять зображення чіткішим, але вимагають більше потужності GPU.\n\nВикористовуйте це для покращення чіткості, масштабування або візуальної стабільності в іграх, які вже працюють нормально. Зменшуйте значення або повертайте стандарт, якщо падає FPS, телефон гріється або графіка стає нестабільною.</string>
     <string name="settings_help_renderer">Vulkan зазвичай є найкращим вибором. OpenGL може допомогти на пристроях зі слабкою підтримкою Vulkan.\n\nVulkan зазвичай найкращий вибір для швидкості та сучасних Android-драйверів. Пробуйте OpenGL лише тоді, коли Vulkan не запускає гру, показує биту графіку або пристрій має слабку підтримку Vulkan.</string>
     <string name="settings_help_screen_filter">Білінійний фільтр згладжує зображення. Найближчий (Nearest) зберігає більш чіткі краї.\n\nВикористовуйте це для покращення чіткості, масштабування або візуальної стабільності в іграх, які вже працюють нормально. Зменшуйте значення або повертайте стандарт, якщо падає FPS, телефон гріється або графіка стає нестабільною.</string>
@@ -1103,7 +1101,6 @@
     <string name="settings_gpu_driver_compatibility_a6xx">Adreno 6xx: Snapdragon 845/855/865/888 і багато моделей серій Snapdragon 6/7</string>
     <string name="settings_gpu_driver_compatibility_a7xx">Adreno 7xx: Snapdragon 8 Gen 1/2/3, 8s Gen 3, 7 Gen 3/4, 7+ Gen 2/3 та 6 Gen 1/3</string>
     <string name="settings_gpu_driver_compatibility_a8xx">Adreno 8xx: Snapdragon 8 Elite Extreme Gen 6, 8 Elite Gen 6, 8 Gen 6, 8 Elite Gen 5, 8 Gen 5, 8s Gen 4, 7s Gen 3/4 та 6 Gen 4</string>
-    <string name="game_manager_db_recommendation">Game DB рекомендує %1$s / %2$s для цієї гри. Обидва параметри можна змінити; збережені налаштування гри мають пріоритет.</string>
     <string name="emulation_ime_done">Готово</string>
     <string name="emulation_ime_system">Клавіатура Android</string>
     <string name="emulation_ime_builtin">Вбудована клавіатура</string>
